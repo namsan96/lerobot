@@ -129,6 +129,9 @@ class RobotClient:
         self.new_action_chunk = None
         self.action_chunk = None
 
+        # Serialize robot access: get_observation() and send_action() use the same port (e.g. Dynamixel).
+        self.robot_lock = threading.Lock()
+
         self.start_barrier = threading.Barrier(2)  # 2 threads: action receiver, control loop
 
         # Observation sender: control loop signals with Event; thread reads self.task and does get_observation + send.
@@ -231,7 +234,8 @@ class RobotClient:
             if not task:
                 continue
             try:
-                raw_observation: RawObservation = self.robot.get_observation()
+                with self.robot_lock:
+                    raw_observation: RawObservation = self.robot.get_observation()
                 raw_observation["task"] = task
                 observation = TimedObservation(
                     timestamp=time.time(),
@@ -324,9 +328,10 @@ class RobotClient:
 
     def control_loop_action(self, timed_action, verbose: bool = False) -> dict[str, Any]:
         """Reading and performing actions in local queue"""
-        _performed_action = self.robot.send_action(
-            self._action_tensor_to_action_dict(timed_action.get_action())
-        )
+        with self.robot_lock:
+            _performed_action = self.robot.send_action(
+                self._action_tensor_to_action_dict(timed_action.get_action())
+            )
         if verbose:
             raise NotImplementedError("Not implemented")
             with self.action_queue_lock:
