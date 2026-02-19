@@ -421,10 +421,11 @@ class FlowModel(DiffusionModel):
         self.noise_scheduler.set_timesteps(self.num_inference_steps)
 
         for i in range(self.num_inference_steps):
-            # Predict model output.
+            # Flow matching: t in [0, 1). UNet expects continuous timestep (same as in compute_loss).
+            tau = i / self.num_inference_steps
             model_output = self.unet(
                 sample,
-                torch.full(sample.shape[:1], i / self.num_inference_steps, dtype=torch.long, device=sample.device),
+                torch.full(sample.shape[:1], tau, dtype=dtype, device=sample.device),
                 global_cond=global_cond,
             )
             sample = sample + model_output / self.num_inference_steps
