@@ -35,6 +35,9 @@ class DatasetConfig:
     use_imagenet_stats: bool = True
     video_backend: str = field(default_factory=get_safe_default_codec)
     streaming: bool = False
+    # Load all video frames into RAM at init for faster __getitem__ (high memory use).
+    cache_videos: bool = False
+    cache_video_resize: tuple[int, int] | None = None
 
 
 @dataclass

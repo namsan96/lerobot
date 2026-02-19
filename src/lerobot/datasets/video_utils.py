@@ -300,6 +300,105 @@ def decode_video_frames_torchcodec(
     return closest_frames
 
 
+def get_all_frames(
+    video_path: Path | str,
+    backend: str | None = None,
+    resize_size: tuple[int, int] | None = None,
+) -> tuple[torch.Tensor, float]:
+    """Load all frames from a video file into memory.
+
+    Returns:
+        Tuple of (frames, fps). frames is a torch.Tensor of shape (T, C, H, W),
+        float32 in [0, 1], matching the format of decode_video_frames.
+    """
+    if backend is None:
+        backend = get_safe_default_codec()
+    video_path = Path(video_path)
+    if backend == "torchcodec":
+        return _get_all_frames_torchcodec(video_path, resize_size)
+    elif backend in ["pyav", "video_reader"]:
+        return _get_all_frames_pyav(video_path, resize_size)
+    else:
+        raise ValueError(f"Unsupported video backend for get_all_frames: {backend}")
+
+
+def _get_all_frames_torchcodec(
+    video_path: Path | str,
+    resize_size: tuple[int, int] | None,
+) -> tuple[torch.Tensor, float]:
+    if importlib.util.find_spec("torchcodec") is None:
+        raise ImportError("torchcodec is required for get_all_frames with torchcodec backend.")
+    from torchcodec.decoders import VideoDecoder
+
+    video_path = str(video_path)
+    num_chunks = 10
+    batch_list: list[torch.Tensor] = []
+    with fsspec.open(video_path) as fh:
+        decoder = VideoDecoder(fh, seek_mode="approximate")
+        metadata = decoder.metadata
+        fps = float(metadata.average_fps)
+        try:
+            num_frames = metadata.num_frames
+        except AttributeError:
+            # Some torchcodec versions expose duration instead
+            duration_s = getattr(metadata, "duration_seconds", 0) or 0
+            num_frames = int(duration_s * fps) if duration_s > 0 else 0
+        if num_frames <= 0:
+            return torch.empty(0, 3, 0, 0, dtype=torch.float32), fps
+        actual_chunks = min(num_chunks, num_frames)
+        chunk_size = (num_frames + actual_chunks - 1) // actual_chunks
+        print(
+            f"[torchcodec] video={video_path} | frames={num_frames} | fps={fps:.2f} | "
+            f"chunks={actual_chunks} (size~{chunk_size}) | resize={resize_size}"
+        )
+        for i in range(actual_chunks):
+            start = i * chunk_size
+            end = min(start + chunk_size, num_frames)
+            indices = list(range(start, end))
+            batch = decoder.get_frames_at(indices=indices)
+            # (N, H, W, C) uint8 -> (N, C, H, W) float32 [0, 1]
+            chunk_frames = batch.data.to(torch.float32) / 255.0
+            if resize_size is not None:
+                chunk_frames = torch.nn.functional.interpolate(
+                    chunk_frames, size=resize_size,
+                    mode="bilinear", align_corners=False, antialias=True
+                )
+            batch_list.append(chunk_frames)
+            pct = 100 * end // num_frames
+            cache_bytes = sum(t.numel() * t.element_size() for t in batch_list)
+            cache_mb = cache_bytes / (1024 * 1024)
+            print(
+                f"Decoding frames {end}/{num_frames} ({pct}%) - batch {i + 1}/{actual_chunks} | "
+                f"cache={cache_mb:.1f}MB ({len(batch_list)} tensors)"
+            )
+    frames = torch.cat(batch_list, dim=0)
+    return frames, fps
+
+
+def _get_all_frames_pyav(
+    video_path: Path | str,
+    resize_size: tuple[int, int] | None,
+) -> tuple[torch.Tensor, float]:
+    raise NotImplementedError("pyav backend is not supported for get_all_frames")
+    video_path = str(video_path)
+    info = get_video_info(video_path)
+    fps = float(info.get("video.fps", 30))
+    loaded = []
+    with av.open(video_path) as container:
+        for frame in container.decode(video=0):
+            arr = frame.to_ndarray(format="rgb24")  # (H, W, 3)
+            loaded.append(torch.from_numpy(arr))
+    if not loaded:
+        return torch.empty(0, 3, 0, 0, dtype=torch.float32), fps
+    # (T, H, W, C) -> (T, C, H, W) float32 [0, 1]
+    frames = torch.stack(loaded).to(torch.float32) / 255.0
+    if resize_size is not None:
+        frames = torch.nn.functional.interpolate(
+            frames, size=resize_size, mode="bilinear", align_corners=False
+        )
+    return frames, fps
+
+
 def encode_video_frames(
     imgs_dir: Path | str,
     video_path: Path | str,

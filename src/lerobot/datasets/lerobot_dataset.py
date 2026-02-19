@@ -70,6 +70,7 @@ from lerobot.datasets.video_utils import (
     concatenate_video_files,
     decode_video_frames,
     encode_video_frames,
+    get_all_frames,
     get_safe_default_codec,
     get_video_duration_in_s,
     get_video_info,
@@ -555,6 +556,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         download_videos: bool = True,
         video_backend: str | None = None,
         batch_encoding_size: int = 1,
+        cache_videos: bool = False,
+        cache_video_resize: tuple[int, int] | None = None,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -667,6 +670,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 You can also use the 'pyav' decoder used by Torchvision, which used to be the default option, or 'video_reader' which is another decoder of Torchvision.
             batch_encoding_size (int, optional): Number of episodes to accumulate before batch encoding videos.
                 Set to 1 for immediate encoding (default), or higher for batched encoding. Defaults to 1.
+            cache_videos (bool, optional): If True, load all video frames into memory at init. Speeds up
+                __getitem__ at the cost of high memory use. Use only when the dataset fits in RAM.
+                Defaults to False.
+            cache_video_resize (tuple[int, int] | None, optional): When cache_videos is True, resize cached
+                frames to this (height, width) to reduce memory. Defaults to None (no resize).
         """
         super().__init__()
         self.repo_id = repo_id
@@ -679,6 +687,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.video_backend = video_backend if video_backend else get_safe_default_codec()
         self.delta_indices = None
         self.batch_encoding_size = batch_encoding_size
+        self.cache_videos = cache_videos
+        self.cache_video_resize = cache_video_resize
         self.episodes_since_last_encoding = 0
 
         # Unused attributes
@@ -718,6 +728,43 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if self.delta_timestamps is not None:
             check_delta_timestamps(self.delta_timestamps, self.fps, self.tolerance_s)
             self.delta_indices = get_delta_indices(self.delta_timestamps, self.fps)
+
+        self._video_cache = None
+        if cache_videos and len(self.meta.video_keys) > 0:
+            self._build_video_cache()
+
+    def _build_video_cache(self) -> None:
+        """Load every unique video file (used by selected episodes) into memory."""
+        import logging
+
+        logger = logging.getLogger(__name__)
+        if hasattr(self.hf_dataset, "unique"):
+            uniq = self.hf_dataset.unique("episode_index")
+            episode_indices = uniq.tolist() if hasattr(uniq, "tolist") else list(uniq)
+        else:
+            episode_indices = list(
+                {int(self.hf_dataset[i]["episode_index"].item()) for i in range(len(self.hf_dataset))}
+            )
+        unique_paths = set()
+        for ep_idx in episode_indices:
+            for vid_key in self.meta.video_keys:
+                p = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
+                unique_paths.add(p)
+        self._video_cache = {}
+        for path in sorted(unique_paths, key=str):
+            if not path.exists():
+                logger.warning("Video file missing for cache: %s", path)
+                continue
+            try:
+                frames, fps = get_all_frames(
+                    path,
+                    backend=self.video_backend,
+                    resize_size=self.cache_video_resize,
+                )
+                self._video_cache[path.as_posix()] = (frames, fps)
+                logger.info("Cached video %s: %d frames", path.name, frames.shape[0])
+            except Exception as e:
+                logger.warning("Failed to cache video %s: %s", path, e)
 
     def _close_writer(self) -> None:
         """Close and cleanup the parquet writer if it exists."""
@@ -964,8 +1011,25 @@ class LeRobotDataset(torch.utils.data.Dataset):
             shifted_query_ts = [from_timestamp + ts for ts in query_ts]
 
             video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
-            frames = decode_video_frames(video_path, shifted_query_ts, self.tolerance_s, self.video_backend)
-            item[vid_key] = frames.squeeze(0)
+            if self._video_cache is not None:
+                cache_key = video_path.as_posix()
+                if cache_key in self._video_cache:
+                    frames_tensor, fps = self._video_cache[cache_key]
+                    num_f = frames_tensor.shape[0]
+                    frame_indices = [
+                        min(max(round(ts * fps), 0), num_f - 1) for ts in shifted_query_ts
+                    ]
+                    frames = frames_tensor[frame_indices]
+                else:
+                    frames = decode_video_frames(
+                        video_path, shifted_query_ts, self.tolerance_s, self.video_backend
+                    )
+            else:
+                frames = decode_video_frames(
+                    video_path, shifted_query_ts, self.tolerance_s, self.video_backend
+                )
+            # Keep (n_obs_steps, C, H, W) so policy gets (B, n_obs_steps, C, H, W) after collate; do not squeeze(0).
+            item[vid_key] = frames
 
         return item
 

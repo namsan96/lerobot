@@ -63,7 +63,9 @@ class DiffusionConfig(PreTrainedConfig):
             [-1, 1] range.
         output_normalization_modes: Similar dictionary as `normalize_input_modes`, but to unnormalize to the
             original scale. Note that this is also used for normalizing the training targets.
-        vision_backbone: Name of the torchvision resnet backbone to use for encoding images.
+        vision_backbone: Vision backbone for encoding images. Use a torchvision ResNet name (e.g.
+            "resnet18", "resnet34") or, for DINOv3 via torch.hub, the hub entrypoint (e.g.
+            "dinov3_vits16plus"). When using DINOv3, set dinov3_hub_repo and dinov3_hub_weights.
         crop_shape: (H, W) shape to crop images to as a preprocessing step for the vision backbone. Must fit
             within the image size. If None, no cropping is done.
         crop_is_random: Whether the crop should be random at training time (it's always a center crop in eval
@@ -120,6 +122,9 @@ class DiffusionConfig(PreTrainedConfig):
     # which avoids excessive padding and leads to improved training results.
     drop_n_last_frames: int = 7  # horizon - n_action_steps - n_obs_steps + 1
 
+    diffusion_type: str = "diffusion"
+    t_schedule: str | None = "beta0.999"
+
     # Architecture / modeling.
     # Vision backbone.
     vision_backbone: str = "resnet18"
@@ -129,6 +134,9 @@ class DiffusionConfig(PreTrainedConfig):
     use_group_norm: bool = True
     spatial_softmax_num_keypoints: int = 32
     use_separate_rgb_encoder_per_camera: bool = False
+    # DINOv3 via torch.hub (when vision_backbone is e.g. "dinov3_vits16plus").
+    dinov3_hub_repo: str | None = None
+    dinov3_hub_weights: str | None = None
     # Unet.
     down_dims: tuple[int, ...] = (512, 1024, 2048)
     kernel_size: int = 5
@@ -163,11 +171,6 @@ class DiffusionConfig(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
-        if not self.vision_backbone.startswith("resnet"):
-            raise ValueError(
-                f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
-            )
-
         supported_prediction_types = ["epsilon", "sample"]
         if self.prediction_type not in supported_prediction_types:
             raise ValueError(

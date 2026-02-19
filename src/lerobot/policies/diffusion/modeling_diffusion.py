@@ -71,7 +71,12 @@ class DiffusionPolicy(PreTrainedPolicy):
         # queues are populated during rollout of the policy, they contain the n latest observations and actions
         self._queues = None
 
-        self.diffusion = DiffusionModel(config)
+        if config.diffusion_type == "diffusion":
+            self.diffusion = DiffusionModel(config)
+        elif config.diffusion_type == "flow":
+            self.diffusion = FlowModel(config)
+        else:
+            raise ValueError(f"Unsupported diffusion type {config.diffusion_type}")
 
         self.reset()
 
@@ -90,11 +95,11 @@ class DiffusionPolicy(PreTrainedPolicy):
             self._queues[OBS_ENV_STATE] = deque(maxlen=self.config.n_obs_steps)
 
     @torch.no_grad()
-    def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+    def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None, full_length: bool = False) -> Tensor:
         """Predict a chunk of actions given environment observations."""
         # stack n latest observations from the queue
         batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
-        actions = self.diffusion.generate_actions(batch, noise=noise)
+        actions = self.diffusion.generate_actions(batch, noise=noise, full_length=full_length)
 
         return actions
 
@@ -169,12 +174,24 @@ class DiffusionModel(nn.Module):
         global_cond_dim = self.config.robot_state_feature.shape[0]
         if self.config.image_features:
             num_images = len(self.config.image_features)
-            if self.config.use_separate_rgb_encoder_per_camera:
-                encoders = [DiffusionRgbEncoder(config) for _ in range(num_images)]
+            if self.config.vision_backbone.startswith("resnet"):
+                if self.config.use_separate_rgb_encoder_per_camera:
+                    encoders = [DiffusionRgbEncoder(config) for _ in range(num_images)]
+                    self.rgb_encoder = nn.ModuleList(encoders)
+                    global_cond_dim += encoders[0].feature_dim * num_images
+                else:
+                    self.rgb_encoder = DiffusionRgbEncoder(config)
+                    global_cond_dim += self.rgb_encoder.feature_dim * num_images
+            elif self.config.vision_backbone == "small_vit":
+                encoders = [
+                    DiffusionSmallVitEncoder(config)
+                    for _ in range(num_images)
+                ]
                 self.rgb_encoder = nn.ModuleList(encoders)
-                global_cond_dim += encoders[0].feature_dim * num_images
+                global_cond_dim += sum(encoder.feature_dim for encoder in encoders)
             else:
-                self.rgb_encoder = DiffusionRgbEncoder(config)
+                # DINOv3 via torch.hub (vision_backbone = hub entrypoint, e.g. dinov3_vits16plus).
+                self.rgb_encoder = DiffusionDinoV3Encoder(config)
                 global_cond_dim += self.rgb_encoder.feature_dim * num_images
         if self.config.env_state_feature:
             global_cond_dim += self.config.env_state_feature.shape[0]
@@ -243,12 +260,19 @@ class DiffusionModel(nn.Module):
             if self.config.use_separate_rgb_encoder_per_camera:
                 # Combine batch and sequence dims while rearranging to make the camera index dimension first.
                 images_per_camera = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> n (b s) ...")
-                img_features_list = torch.cat(
-                    [
-                        encoder(images)
+
+                if self.config.vision_backbone == "small_vit":
+                    img_features_list = torch.cat([
+                        encoder(images, batch[OBS_STATE])
                         for encoder, images in zip(self.rgb_encoder, images_per_camera, strict=True)
-                    ]
-                )
+                    ])
+                else:
+                    img_features_list = torch.cat(
+                        [
+                            encoder(images)
+                            for encoder, images in zip(self.rgb_encoder, images_per_camera, strict=True)
+                        ]
+                    )
                 # Separate batch and sequence dims back out. The camera index dim gets absorbed into the
                 # feature dim (effectively concatenating the camera features).
                 img_features = einops.rearrange(
@@ -272,7 +296,7 @@ class DiffusionModel(nn.Module):
         # Concatenate features then flatten to (B, global_cond_dim).
         return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
 
-    def generate_actions(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+    def generate_actions(self, batch: dict[str, Tensor], noise: Tensor | None = None, full_length: bool = False) -> Tensor:
         """
         This function expects `batch` to have:
         {
@@ -294,8 +318,11 @@ class DiffusionModel(nn.Module):
 
         # Extract `n_action_steps` steps worth of actions (from the current observation).
         start = n_obs_steps - 1
-        end = start + self.config.n_action_steps
-        actions = actions[:, start:end]
+        if full_length:
+            actions = actions[:, start:]
+        else:
+            end = start + self.config.n_action_steps
+            actions = actions[:, start:end]
 
         return actions
 
@@ -361,6 +388,82 @@ class DiffusionModel(nn.Module):
                 )
             in_episode_bound = ~batch["action_is_pad"]
             loss = loss * in_episode_bound.unsqueeze(-1)
+
+        return loss.mean()
+
+
+class FlowModel(DiffusionModel):
+    def __init__(self, config: DiffusionConfig):
+        super().__init__(config)
+
+    def conditional_sample(
+        self,
+        batch_size: int,
+        global_cond: Tensor | None = None,
+        generator: torch.Generator | None = None,
+        noise: Tensor | None = None,
+    ) -> Tensor:
+        device = get_device_from_parameters(self)
+        dtype = get_dtype_from_parameters(self)
+
+        # Sample prior.
+        sample = (
+            noise
+            if noise is not None
+            else torch.randn(
+                size=(batch_size, self.config.horizon, self.config.action_feature.shape[0]),
+                dtype=dtype,
+                device=device,
+                generator=generator,
+            )
+        )
+
+        self.noise_scheduler.set_timesteps(self.num_inference_steps)
+
+        for i in range(self.num_inference_steps):
+            # Predict model output.
+            model_output = self.unet(
+                sample,
+                torch.full(sample.shape[:1], i / self.num_inference_steps, dtype=torch.long, device=sample.device),
+                global_cond=global_cond,
+            )
+            sample = sample + model_output / self.num_inference_steps
+        return sample
+
+    def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
+        # Input validation.
+        assert set(batch).issuperset({OBS_STATE, ACTION, "action_is_pad"})
+        assert OBS_IMAGES in batch or OBS_ENV_STATE in batch
+        n_obs_steps = batch[OBS_STATE].shape[1]
+        horizon = batch[ACTION].shape[1]
+        assert horizon == self.config.horizon
+        assert n_obs_steps == self.config.n_obs_steps
+
+        # Encode image features and concatenate them all together along with the state vector.
+        global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
+# Forward diffusion.
+        trajectory = batch[ACTION]
+        # Sample noise to add to the trajectory.
+        eps = torch.randn(trajectory.shape, device=trajectory.device)
+
+        B = trajectory.shape[0]
+        device = trajectory.device
+
+        if self.config.t_schedule is None:
+            timesteps = torch.rand(B, device=device)[:, None, None]
+        elif self.config.t_schedule == 'beta0.999':
+            z = torch.distributions.Beta(1.5, 1).sample((B,)).to(device)
+            timesteps = 0.999 * (1 - z)
+            timesteps = timesteps[:, None, None]
+
+        noisy_trajectory = (1 - timesteps) * eps + timesteps * trajectory
+
+        vel = trajectory - eps
+        pred = self.unet(noisy_trajectory, timesteps[:, 0, 0], global_cond=global_cond)
+        loss = F.mse_loss(pred, vel)
+
+        if self.config.do_mask_loss_for_padding:
+            raise NotImplementedError("Mask loss for padding is not implemented for flow model")
 
         return loss.mean()
 
@@ -434,6 +537,95 @@ class SpatialSoftmax(nn.Module):
         feature_keypoints = expected_xy.view(-1, self._out_c, 2)
 
         return feature_keypoints
+
+
+class DiffusionSmallVitEncoder(nn.Module):
+    """Single image-view ViT encoder for diffusion: 96x96 resize + VitEncoder (speedaug), one per camera."""
+
+    IMG_SIZE = 96
+
+    def __init__(self, config: DiffusionConfig) -> None:
+        super().__init__()
+        from speedaug.models.common.vit import VitEncoder, VitEncoderConfig
+        from speedaug.models.common.modules import SpatialEmb
+
+        self.backbone = VitEncoder(
+            VitEncoderConfig(
+                patch_size=8,
+                depth=1,
+                embed_dim=64,
+                num_heads=4,
+                embed_style="embed2",
+                embed_norm=0,
+            ),
+            num_channel=3,
+            img_h=self.IMG_SIZE,
+            img_w=self.IMG_SIZE,
+            n_img=1,
+        )
+        self.compress = SpatialEmb(
+            num_patch=self.backbone.num_patch,
+            patch_dim=self.backbone.patch_repr_dim,
+            prop_dim=config.robot_state_feature.shape[0],
+            proj_dim=64,
+            dropout=0,
+        )
+        self.feature_dim = 64
+        self.resize = torchvision.transforms.Resize((self.IMG_SIZE, self.IMG_SIZE))
+
+    def forward(self, x: Tensor, state: Tensor) -> Tensor:
+        if x.shape[-2:] != (self.IMG_SIZE, self.IMG_SIZE):
+            x = self.resize(x)
+        x = self.backbone(x, scale=False)
+        x = self.compress(x, state.flatten(1, 2))
+        return x
+
+
+class DiffusionDinoV3Encoder(nn.Module):
+    """Encodes an RGB image into a 1D feature vector using DINOv3 loaded via torch.hub (local repo).
+    Requires dinov3_hub_repo (path to local dinov3 repo); dinov3_hub_weights is the checkpoint path.
+    """
+
+    IMG_SIZE = 256
+    IMAGENET_MEAN = (0.485, 0.456, 0.406)
+    IMAGENET_STD = (0.229, 0.224, 0.225)
+
+    def __init__(self, config: DiffusionConfig):
+        super().__init__()
+        repo_dir = getattr(config, "dinov3_hub_repo", None)
+        if not repo_dir:
+            raise ValueError(
+                "DiffusionDinoV3Encoder requires config.dinov3_hub_repo (path to local dinov3 repo)."
+            )
+        entrypoint = config.vision_backbone  # e.g. "dinov3_vits16plus"
+        weights_path = getattr(config, "dinov3_hub_weights", None)
+        hub_kwargs = {"source": "local", "pretrained": True}
+        if weights_path:
+            hub_kwargs["weights"] = weights_path
+        self.backbone = torch.hub.load(repo_dir, entrypoint, **hub_kwargs)
+        # DinoVisionTransformer has .embed_dim; ConvNeXt may use .dims[-1].
+        self.feature_dim = self.backbone.embed_dim
+        self.resize = torchvision.transforms.Resize((self.IMG_SIZE, self.IMG_SIZE))
+        self._config = config
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Args:
+            x: (B, C, H, W) image tensor with pixel values in [0, 1].
+        Returns:
+            (B, feature_dim) image features (CLS token).
+        """
+        if x.shape[-2:] != (self.IMG_SIZE, self.IMG_SIZE):
+            x = self.resize(x)
+        # [0, 1] -> ImageNet normalize
+        mean = torch.tensor(self.IMAGENET_MEAN, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+        std = torch.tensor(self.IMAGENET_STD, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+        x = (x - mean) / std
+        # Backbone forward: DinoVisionTransformer returns (B, num_tokens, embed_dim) or dict with CLS.
+        out = self.backbone(x)
+        if isinstance(out, dict):
+            out = out['x_norm_clstoken']
+        return out
 
 
 class DiffusionRgbEncoder(nn.Module):
