@@ -12,18 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Client side: The environment evolves with a time resolution equal to 1/fps"""
+"""Config for FakeRobot – offline testing with no hardware. Always returns zeros."""
 
-DEFAULT_FPS = 30
+from dataclasses import dataclass, field
 
-"""Server side: Running inference on (at most) 1/fps"""
-DEFAULT_INFERENCE_LATENCY = 1 / DEFAULT_FPS
+from lerobot.cameras import CameraConfig
 
-"""Server side: Timeout for observation queue in seconds"""
-DEFAULT_OBS_QUEUE_TIMEOUT = 2
+from ..config import RobotConfig
 
-# All action chunking policies
-SUPPORTED_POLICIES = ["act", "smolvla", "diffusion", "tdmpc", "vqbet", "pi0", "pi05"]
 
-# TODO: Add all other robots
-SUPPORTED_ROBOTS = ["so100_follower", "so101_follower", "bi_so100_follower", "fake_robot"]
+@RobotConfig.register_subclass("fake_robot")
+@dataclass
+class FakeRobotConfig(RobotConfig):
+    """Minimal config for FakeRobot. No port or real cameras required."""
+
+    # Optional camera keys and shapes for observation_features (height, width, 3).
+    # If empty, observation has only state keys (same as so100_follower joints).
+    cameras: dict[str, CameraConfig] = field(default_factory=dict)

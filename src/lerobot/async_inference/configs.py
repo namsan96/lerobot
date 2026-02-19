@@ -142,6 +142,8 @@ class RobotClientConfig:
         default=False, metadata={"help": "Visualize the action queue size"}
     )
 
+    commit_steps: int = field(default=10, metadata={"help": "Number of steps to commit at once"})
+
     @property
     def environment_dt(self) -> float:
         """Environment time step, in seconds"""

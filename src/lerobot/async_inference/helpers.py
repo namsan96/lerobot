@@ -128,7 +128,7 @@ def extract_images_from_raw_observation(
     camera_key: str,
 ) -> dict[str, torch.Tensor]:
     """Extract the images from a raw observation."""
-    return torch.tensor(lerobot_obs[camera_key])
+    return torch.as_tensor(lerobot_obs[camera_key])
 
 
 def make_lerobot_observation(
@@ -161,7 +161,7 @@ def prepare_raw_observation(
     # Turns the image features to (C, H, W) with H, W matching the policy image features.
     # This reduces the resolution of the images
     image_dict = {
-        key: resize_robot_observation_image(torch.tensor(lerobot_obs[key]), policy_image_features[key].shape)
+        key: resize_robot_observation_image(torch.as_tensor(lerobot_obs[key]), policy_image_features[key].shape)
         for key in image_keys
     }
 
@@ -269,6 +269,7 @@ class RemotePolicyConfig:
     actions_per_chunk: int
     device: str = "cpu"
     rename_map: dict[str, str] = field(default_factory=dict)
+    commit_steps: int | None = None
 
 
 def _compare_observation_states(obs1_state: torch.Tensor, obs2_state: torch.Tensor, atol: float) -> bool:
