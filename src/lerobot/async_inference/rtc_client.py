@@ -29,6 +29,9 @@ python src/lerobot/async_inference/robot_client.py \
     --chunk_size_threshold=0.5 \
     --aggregate_fn_name=weighted_average \
     --debug_visualize_queue_size=True
+
+Policy options can be overridden from the CLI; they are sent to the server and applied when loading the policy:
+    --policy.num_inference_steps=10 --policy.device=cuda
 ```
 """
 
@@ -63,6 +66,8 @@ from lerobot.transport import (
     services_pb2_grpc,  # type: ignore
 )
 from lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
+
+from lerobot.configs import parser as config_parser
 
 from .configs import RobotClientConfig
 from .constants import SUPPORTED_ROBOTS
@@ -108,6 +113,7 @@ class RobotClient:
             device=config.policy_device,
             rename_map=getattr(config, "rename_map", {}),
             commit_steps=getattr(config, "commit_steps", None),
+            policy_cli_overrides=getattr(config, "policy_cli_overrides", None) or [],
         )
         self.channel = grpc.insecure_channel(
             self.server_address, grpc_channel_options(initial_backoff=f"{config.environment_dt:.4f}s")
@@ -408,6 +414,9 @@ class RobotClient:
 
 @draccus.wrap()
 def async_client(cfg: RobotClientConfig):
+    # Collect --policy.xxx CLI overrides so they are sent to the server and applied when loading the policy.
+    cfg.policy_cli_overrides = config_parser.get_cli_overrides("policy") or []
+
     logging.info(pformat(asdict(cfg)))
 
     if cfg.robot.type not in SUPPORTED_ROBOTS:

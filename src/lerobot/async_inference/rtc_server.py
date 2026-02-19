@@ -137,12 +137,18 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 f"Supported policies: {SUPPORTED_POLICIES}"
             )
 
+        client_overrides = getattr(policy_specs, "policy_cli_overrides", None) or []
+        server_overrides = getattr(self.config, "policy_cli_overrides", None) or []
+        cli_overrides = client_overrides + server_overrides
+        if server_overrides:
+            self.logger.info(f"Server policy overrides (from CLI): {server_overrides}")
         self.logger.info(
             f"Receiving policy instructions from {client_id} | "
             f"Policy type: {policy_specs.policy_type} | "
             f"Pretrained name or path: {policy_specs.pretrained_name_or_path} | "
             f"Actions per chunk: {policy_specs.actions_per_chunk} | "
             f"Device: {policy_specs.device}"
+            + (f" | CLI overrides: {cli_overrides}" if cli_overrides else "")
         )
 
         self.device = policy_specs.device
@@ -154,7 +160,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         policy_class = get_policy_class(self.policy_type)
 
         start = time.perf_counter()
-        self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
+        self.policy = policy_class.from_pretrained(
+            policy_specs.pretrained_name_or_path,
+            cli_overrides=cli_overrides,
+        )
         self.policy.to(self.device)
 
         # Load preprocessor and postprocessor, overriding device to match requested device
@@ -427,6 +436,10 @@ def serve(cfg: PolicyServerConfig):
     Args:
         config: PolicyServerConfig instance. If None, uses default configuration.
     """
+    # Apply policy overrides collected by __main__ (--policy.xxx stripped from argv before parse)
+    if getattr(serve, "_policy_cli_overrides", None) is not None:
+        cfg.policy_cli_overrides = getattr(serve, "_policy_cli_overrides")
+
     logging.info(pformat(asdict(cfg)))
 
     # Create the server instance first
@@ -446,4 +459,11 @@ def serve(cfg: PolicyServerConfig):
 
 
 if __name__ == "__main__":
+    import sys
+
+    from lerobot.configs import parser as config_parser
+
+    # Collect --policy.xxx and remove from argv so draccus does not reject them (PolicyServerConfig has no policy field).
+    serve._policy_cli_overrides = config_parser.get_cli_overrides("policy") or []
+    sys.argv = [sys.argv[0]] + [a for a in sys.argv[1:] if not a.startswith("--policy.")]
     serve()

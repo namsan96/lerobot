@@ -64,6 +64,12 @@ class PolicyServerConfig:
         default=DEFAULT_OBS_QUEUE_TIMEOUT, metadata={"help": "Timeout for observation queue in seconds"}
     )
 
+    # Policy CLI overrides (e.g. from --policy.dinov3_hub_repo=...). Set by server entrypoint after stripping argv.
+    policy_cli_overrides: list[str] = field(
+        default_factory=list,
+        metadata={"help": "Policy config overrides passed on server CLI (--policy.xxx=...); applied when loading policy."},
+    )
+
     def __post_init__(self):
         """Validate configuration after initialization."""
         if self.port < 1 or self.port > 65535:
@@ -143,6 +149,12 @@ class RobotClientConfig:
     )
 
     commit_steps: int = field(default=10, metadata={"help": "Number of steps to commit at once"})
+
+    # Populated from CLI --policy.xxx by the client entrypoint; sent to server so policy is loaded with same overrides.
+    policy_cli_overrides: list[str] = field(
+        default_factory=list,
+        metadata={"help": "Policy config overrides (e.g. from --policy.num_inference_steps=10); set from CLI when using rtc_client."},
+    )
 
     @property
     def environment_dt(self) -> float:

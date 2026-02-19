@@ -270,6 +270,8 @@ class RemotePolicyConfig:
     device: str = "cpu"
     rename_map: dict[str, str] = field(default_factory=dict)
     commit_steps: int | None = None
+    # CLI overrides for policy config (e.g. ["--num_inference_steps=10"]) so server loads policy with same overrides.
+    policy_cli_overrides: list[str] = field(default_factory=list)
 
 
 def _compare_observation_states(obs1_state: torch.Tensor, obs2_state: torch.Tensor, atol: float) -> bool:
