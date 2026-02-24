@@ -151,6 +151,14 @@ class DiffusionPolicy(PreTrainedPolicy):
         # no output_dict so returning None
         return loss, None
 
+    def critic_forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
+        """Run the critic on a batch with 'ret' targets and return the MSE loss."""
+        if self.config.image_features:
+            batch = dict(batch)
+            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+        loss = self.diffusion.critic_loss(batch)
+        return loss, None
+
 
 def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMScheduler:
     """
@@ -165,16 +173,39 @@ def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMSche
         raise ValueError(f"Unsupported noise scheduler type {name}")
 
 
+class DiffusionCritic(nn.Module):
+    """Value function: global_cond → scalar return estimate."""
+
+    def __init__(self, obs_dim: int, hidden_dims: tuple[int, ...]):
+        super().__init__()
+        layers = []
+        in_dim = obs_dim
+        for h in hidden_dims:
+            layers += [nn.Linear(in_dim, h), nn.ReLU()]
+            in_dim = h
+        layers.append(nn.Linear(in_dim, 1))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, global_cond: Tensor) -> Tensor:
+        return self.net(global_cond)  # (B, 1)
+
+
 class DiffusionModel(nn.Module):
     def __init__(self, config: DiffusionConfig):
         super().__init__()
         self.config = config
 
         # Build observation encoders (depending on which observations are provided).
+        use_dit = config.use_dit
         global_cond_dim = self.config.robot_state_feature.shape[0]
         if self.config.image_features:
             num_images = len(self.config.image_features)
-            if self.config.vision_backbone.startswith("resnet"):
+            if use_dit:
+                if self.config.vision_backbone.startswith("resnet") or self.config.vision_backbone == "small_vit":
+                    raise ValueError("DiT option requires DinoV3 vision backbone (e.g. dinov3_vits16plus).")
+                self.rgb_encoder = DiffusionDinoV3Encoder(config)
+                global_cond_dim += self.rgb_encoder.feature_dim * num_images
+            elif self.config.vision_backbone.startswith("resnet"):
                 if self.config.use_separate_rgb_encoder_per_camera:
                     encoders = [DiffusionRgbEncoder(config) for _ in range(num_images)]
                     self.rgb_encoder = nn.ModuleList(encoders)
@@ -190,13 +221,34 @@ class DiffusionModel(nn.Module):
                 self.rgb_encoder = nn.ModuleList(encoders)
                 global_cond_dim += sum(encoder.feature_dim for encoder in encoders)
             else:
-                # DINOv3 via torch.hub (vision_backbone = hub entrypoint, e.g. dinov3_vits16plus).
                 self.rgb_encoder = DiffusionDinoV3Encoder(config)
                 global_cond_dim += self.rgb_encoder.feature_dim * num_images
         if self.config.env_state_feature:
             global_cond_dim += self.config.env_state_feature.shape[0]
 
-        self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
+        base_global_cond_dim = global_cond_dim * config.n_obs_steps
+
+        if config.use_critic:
+            self.critic = DiffusionCritic(base_global_cond_dim, config.critic_hidden_dims)
+            self.adv_embedding = nn.Embedding(2, config.adv_embed_dim)
+            unet_cond_dim = base_global_cond_dim + config.adv_embed_dim
+        else:
+            unet_cond_dim = base_global_cond_dim
+
+        if use_dit:
+            state_dim = (
+                self.config.robot_state_feature.shape[0] * config.n_obs_steps
+                + (self.config.env_state_feature.shape[0] if self.config.env_state_feature else 0)
+            )
+            if config.use_critic:
+                state_dim += config.adv_embed_dim
+            self.unet = Gr00tDiTUnetWrapper(
+                config,
+                encoder_token_dim=self.rgb_encoder.feature_dim,
+                state_dim=state_dim,
+            )
+        else:
+            self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=unet_cond_dim)
 
         self.noise_scheduler = _make_noise_scheduler(
             config.noise_scheduler_type,
@@ -251,13 +303,25 @@ class DiffusionModel(nn.Module):
 
         return sample
 
-    def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
-        """Encode image features and concatenate them all together along with the state vector."""
+    def _prepare_base_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
+        """Encode image features and concatenate them all together along with the state vector.
+
+        Returns (B, base_global_cond_dim) without any advantage embedding.
+        """
         batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
         global_cond_feats = [batch[OBS_STATE]]
         # Extract image features.
         if self.config.image_features:
-            if self.config.use_separate_rgb_encoder_per_camera:
+            if self.config.use_dit:
+                # Token encoder returns (B, 1+N, D); mean-pool over tokens for flat conditioning (e.g. critic).
+                tokens = self.rgb_encoder(
+                    einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ...")
+                )
+                img_features = tokens.mean(dim=1)
+                img_features = einops.rearrange(
+                    img_features, "(b s n) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
+                )
+            elif self.config.use_separate_rgb_encoder_per_camera:
                 # Combine batch and sequence dims while rearranging to make the camera index dimension first.
                 images_per_camera = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> n (b s) ...")
 
@@ -293,8 +357,51 @@ class DiffusionModel(nn.Module):
         if self.config.env_state_feature:
             global_cond_feats.append(batch[OBS_ENV_STATE])
 
-        # Concatenate features then flatten to (B, global_cond_dim).
+        # Concatenate features then flatten to (B, base_global_cond_dim).
         return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
+
+    def _prepare_global_conditioning_dit(self, batch: dict[str, Tensor]) -> dict:
+        """Prepare conditioning for DiT unet: encoder_tokens (B, N, D) and state (B, state_dim)."""
+        batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
+        num_cams = batch[OBS_IMAGES].shape[2]
+        tokens = self.rgb_encoder(
+            einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ...")
+        )
+        # obs step / cam id are not encoded
+        tokens = einops.rearrange(
+            tokens,
+            "(b s n) t d -> b (s n t) d",
+            b=batch_size,
+            s=n_obs_steps,
+            n=num_cams,
+        )
+        state_list = [batch[OBS_STATE]]
+        if self.config.env_state_feature:
+            state_list.append(batch[OBS_ENV_STATE])
+        state = torch.cat(state_list, dim=-1).flatten(start_dim=1)
+        if self.config.use_critic:
+            if "adv_cond" in batch:
+                adv_cond = batch["adv_cond"].long()
+            else:
+                adv_cond = torch.ones(batch_size, dtype=torch.long, device=state.device)
+            state = torch.cat([state, self.adv_embedding(adv_cond)], dim=-1)
+        return {"encoder_tokens": tokens, "state": state}
+
+    def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor | dict:
+        """Encode observations and optionally append advantage embedding for DPPO-style conditioning.
+        When use_dit is True, returns a dict for the DiT wrapper; otherwise a flat tensor."""
+        if self.config.use_dit:
+            return self._prepare_global_conditioning_dit(batch)
+        global_cond = self._prepare_base_global_conditioning(batch)  # (B, base_cond_dim)
+        if self.config.use_critic:
+            if "adv_cond" in batch:
+                adv_cond = batch["adv_cond"].long()
+            else:
+                # Inference default: high advantage (adv_cond=1)
+                adv_cond = torch.ones(global_cond.shape[0], dtype=torch.long, device=global_cond.device)
+            adv_embed = self.adv_embedding(adv_cond)  # (B, adv_embed_dim)
+            global_cond = torch.cat([global_cond, adv_embed], dim=-1)
+        return global_cond
 
     def generate_actions(self, batch: dict[str, Tensor], noise: Tensor | None = None, full_length: bool = False) -> Tensor:
         """
@@ -390,6 +497,12 @@ class DiffusionModel(nn.Module):
             loss = loss * in_episode_bound.unsqueeze(-1)
 
         return loss.mean()
+
+    def critic_loss(self, batch: dict[str, Tensor]) -> Tensor:
+        """MSE loss for value critic: V(obs) → return estimate."""
+        global_cond = self._prepare_base_global_conditioning(batch)  # (B, base_cond_dim)
+        values = self.critic(global_cond).squeeze(-1)  # (B,)
+        return F.mse_loss(values, batch["ret"])
 
 
 class FlowModel(DiffusionModel):
@@ -583,8 +696,9 @@ class DiffusionSmallVitEncoder(nn.Module):
 
 
 class DiffusionDinoV3Encoder(nn.Module):
-    """Encodes an RGB image into a 1D feature vector using DINOv3 loaded via torch.hub (local repo).
-    Requires dinov3_hub_repo (path to local dinov3 repo); dinov3_hub_weights is the checkpoint path.
+    """Encodes an RGB image using DINOv3 loaded via torch.hub (local repo).
+    When return_patch_tokens is True (e.g. for DiT), returns (B, N_patches, embed_dim) from x_norm_patchtokens.
+    Otherwise returns (B, feature_dim) CLS token.
     """
 
     IMG_SIZE = 256
@@ -604,28 +718,29 @@ class DiffusionDinoV3Encoder(nn.Module):
         if weights_path:
             hub_kwargs["weights"] = weights_path
         self.backbone = torch.hub.load(repo_dir, entrypoint, **hub_kwargs)
-        # DinoVisionTransformer has .embed_dim; ConvNeXt may use .dims[-1].
         self.feature_dim = self.backbone.embed_dim
         self.resize = torchvision.transforms.Resize((self.IMG_SIZE, self.IMG_SIZE))
         self._config = config
+        self.return_patch_tokens = config.use_dit
 
     def forward(self, x: Tensor) -> Tensor:
         """
         Args:
             x: (B, C, H, W) image tensor with pixel values in [0, 1].
         Returns:
-            (B, feature_dim) image features (CLS token).
+            (B, feature_dim) CLS token, or (B, N_patches, feature_dim) patch tokens when return_patch_tokens.
         """
         if x.shape[-2:] != (self.IMG_SIZE, self.IMG_SIZE):
             x = self.resize(x)
-        # [0, 1] -> ImageNet normalize
         mean = torch.tensor(self.IMAGENET_MEAN, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
         std = torch.tensor(self.IMAGENET_STD, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
         x = (x - mean) / std
-        # Backbone forward: DinoVisionTransformer returns (B, num_tokens, embed_dim) or dict with CLS.
-        out = self.backbone(x)
-        if isinstance(out, dict):
-            out = out['x_norm_clstoken']
+
+        if self.return_patch_tokens:
+            out = self.backbone.forward_features(x)
+            out = out['x_norm_patchtokens']
+        else:
+            out = self.backbone(x)
         return out
 
 
@@ -896,6 +1011,87 @@ class DiffusionConditionalUnet1d(nn.Module):
 
         x = einops.rearrange(x, "b d t -> b t d")
         return x
+
+
+class Gr00tDiTUnetWrapper(nn.Module):
+    """GR00T-style DiT as drop-in for self.unet: forward(x, timestep, global_cond) -> (B, T, action_dim).
+    State and action are encoded, stacked as DiT input; encoder_tokens (vision) are encoder_hidden_states.
+    - State encoder: 2-layer MLP (s -> h -> h).
+    - Action encoder: 2-layer MLP (T, a) -> (T, h) -> (T, h) with action position embeddings.
+    - Action decoder: 2-layer MLP (h -> h -> a) on DiT output action tokens.
+    """
+
+    def __init__(self, config: DiffusionConfig, encoder_token_dim: int, state_dim: int):
+        super().__init__()
+        try:
+            from gr00t.model.modules.dit import DiT
+        except ImportError as e:
+            raise ImportError("Gr00tDiTUnetWrapper requires gr00t. Use diffusion_type='diffusion'.") from e
+        self.config = config
+        action_dim = config.action_feature.shape[0]
+        horizon = config.horizon
+        embedding_hidden_dim = config.dit_embedding_hidden_dim
+        dit_hidden_dim = config.dit_num_attention_heads * config.dit_attention_head_dim
+        cross_dim = encoder_token_dim
+
+        # State encoder: 2-layer MLP (s -> h -> h)
+        self.state_encoder = nn.Sequential(
+            nn.Linear(state_dim, embedding_hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(embedding_hidden_dim, dit_hidden_dim),
+        )
+
+        # Action encoder: 2 layers (T, a) -> (T, h) -> (T, h)
+        self.action_encoder = nn.Sequential(
+            nn.Linear(action_dim, embedding_hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(embedding_hidden_dim, dit_hidden_dim),
+        )
+
+        # Action position embeddings (for the T action tokens)
+        self.action_position_embedding = nn.Embedding(horizon, dit_hidden_dim)
+        nn.init.normal_(self.action_position_embedding.weight, mean=0.0, std=0.02)
+
+        self.dit = DiT(
+            num_attention_heads=config.dit_num_attention_heads,
+            attention_head_dim=config.dit_attention_head_dim,
+            output_dim=embedding_hidden_dim,
+            num_layers=config.dit_num_layers,
+            dropout=config.dit_dropout,
+            norm_type=config.dit_norm_type,
+            interleave_self_attention=config.dit_interleave_self_attention,
+            cross_attention_dim=cross_dim,
+        )
+
+        # Action decoder: 2-layer MLP (h -> h -> a)
+        self.action_decoder = nn.Sequential(
+            nn.Linear(embedding_hidden_dim, embedding_hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(embedding_hidden_dim, action_dim),
+        )
+
+    def forward(self, x: Tensor, timestep: Tensor | int, global_cond=None) -> Tensor:
+        if not isinstance(global_cond, dict) or "encoder_tokens" not in global_cond or "state" not in global_cond:
+            raise ValueError("Gr00tDiTUnetWrapper expects global_cond dict with 'encoder_tokens' and 'state'.")
+        encoder_tokens = global_cond["encoder_tokens"]
+        state = global_cond["state"]
+        B, T, _ = x.shape
+
+        state_embed = self.state_encoder(state).unsqueeze(1)
+        action_embed = self.action_encoder(x)
+        pos_ids = torch.arange(T, dtype=torch.long, device=x.device)
+        action_embed = action_embed + self.action_position_embedding(pos_ids).unsqueeze(0)
+        hidden_states = torch.cat([state_embed, action_embed], dim=1)
+
+        if isinstance(timestep, int):
+            timestep = torch.full((B,), timestep, device=x.device, dtype=torch.long)
+        out = self.dit(
+            hidden_states,
+            encoder_hidden_states=encoder_tokens,
+            timestep=timestep,
+        )
+        action_tokens = out[:, 1:, :]
+        return self.action_decoder(action_tokens)
 
 
 class DiffusionConditionalResidualBlock1d(nn.Module):

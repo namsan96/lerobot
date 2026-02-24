@@ -27,6 +27,8 @@ class DatasetConfig:
     # "dataset_index" into the returned item. The index mapping is made according to the order in which the
     # datasets are provided.
     repo_id: str
+    # Additional dataset paths to concatenate with the primary dataset for training.
+    extra_repo_ids: list[str] = field(default_factory=list)
     # Root directory where the dataset will be stored (e.g. 'dataset/path').
     root: str | None = None
     episodes: list[int] | None = None

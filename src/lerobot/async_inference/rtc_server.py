@@ -165,6 +165,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             cli_overrides=cli_overrides,
         )
         self.policy.to(self.device)
+        self.policy.eval()
 
         # Load preprocessor and postprocessor, overriding device to match requested device
         device_override = {"device": self.device}

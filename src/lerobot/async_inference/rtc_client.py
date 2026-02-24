@@ -47,10 +47,13 @@ from typing import Any
 
 import draccus
 import grpc
+import numpy as np
 import torch
 
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.utils import build_dataset_frame, combine_feature_dicts, hw_to_dataset_features
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
@@ -66,6 +69,8 @@ from lerobot.transport import (
     services_pb2_grpc,  # type: ignore
 )
 from lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
+from lerobot.utils.constants import ACTION, OBS_STR
+from lerobot.utils.control_utils import init_keyboard_listener
 
 from lerobot.configs import parser as config_parser
 
@@ -129,22 +134,53 @@ class RobotClient:
         self.new_action_chunk = None
         self.action_chunk = None
 
-        # Serialize robot access: get_observation() and send_action() use the same port (e.g. Dynamixel).
-        self.robot_lock = threading.Lock()
-
         self.start_barrier = threading.Barrier(2)  # 2 threads: action receiver, control loop
 
-        # Observation sender: control loop signals with Event; thread reads self.task and does get_observation + send.
+        # Observation sender: control loop captures obs each iteration, stores here, then signals sender.
+        # No lock needed: event.set() happens-after the write, event.wait() happens-before the read.
+        self.latest_raw_obs: RawObservation | None = None
         self.observation_requested = threading.Event()
         self.task: str = ""  # set at start of control_loop; observation_sender uses it when signaled
 
+        # Dataset recording (optional)
+        self.dataset: LeRobotDataset | None = None
+        if config.dataset_repo_id is not None:
+            num_cameras = len(self.robot.cameras) if hasattr(self.robot, "cameras") else 0
+            dataset_features = self._make_dataset_features(config.dataset_video)
+            self.dataset = LeRobotDataset.create(
+                config.dataset_repo_id,
+                config.fps,
+                root=config.dataset_root,
+                robot_type=self.robot.name,
+                features=dataset_features,
+                use_videos=config.dataset_video,
+                image_writer_processes=config.dataset_num_image_writer_processes,
+                image_writer_threads=config.dataset_num_image_writer_threads_per_camera * num_cameras,
+            )
+
         # FPS measurement
         self.fps_tracker = FPSTracker(target_fps=self.config.fps)
+
+        # Keyboard listener for episode control (right=next, left=rerecord, esc=stop)
+        self.listener, self.events = init_keyboard_listener()
 
         self.logger.info("Robot connected and ready")
 
         self.horizon = self.config.actions_per_chunk
         self.commit_steps = self.config.commit_steps
+
+    def _make_dataset_features(self, use_videos: bool) -> dict:
+        obs_features = hw_to_dataset_features(self.robot.observation_features, OBS_STR, use_video=use_videos)
+        action_features = hw_to_dataset_features(self.robot.action_features, ACTION, use_video=use_videos)
+        reward_feature = {"reward": {"dtype": "float32", "shape": (1,), "names": None}}
+        return combine_feature_dicts(obs_features, action_features, reward_feature)
+
+    def _prompt_reward(self) -> float:
+        while True:
+            val = input("Episode reward (0 or 1): ").strip()
+            if val in ("0", "1"):
+                return float(val)
+            print("Please enter 0 or 1.")
 
     @property
     def running(self):
@@ -184,6 +220,17 @@ class RobotClient:
         """Stop the robot client"""
         self.shutdown_event.set()
         self.observation_requested.set()  # wake observation_sender so it can exit
+
+        if self.dataset is not None:
+            # Safety net: save any frames buffered by an unexpected shutdown (e.g. SIGINT mid-episode)
+            if self.dataset.episode_buffer is not None and self.dataset.episode_buffer["size"] > 0:
+                self.dataset.save_episode()
+                self.logger.info("Saved partial episode on shutdown")
+            if self.dataset.image_writer is not None:
+                self.dataset.image_writer.stop()
+
+        if self.listener is not None:
+            self.listener.stop()
 
         self.robot.disconnect()
         self.logger.debug("Robot disconnected")
@@ -226,20 +273,21 @@ class RobotClient:
             return False
 
     def observation_sender(self) -> None:
-        """Thread: on signal, runs get_observation() and send_observation() so the control loop never blocks on I/O."""
+        """Thread: on signal from control loop, reads the already-captured observation and sends it.
+        The control loop writes latest_raw_obs then sets observation_requested, so no lock is needed."""
         while self.running:
             self.observation_requested.wait()
             self.observation_requested.clear()
+            raw_obs = self.latest_raw_obs
             task = self.task
-            if not task:
+            if raw_obs is None or not task:
                 continue
             try:
-                with self.robot_lock:
-                    raw_observation: RawObservation = self.robot.get_observation()
-                raw_observation["task"] = task
+                obs_with_task = dict(raw_obs)
+                obs_with_task["task"] = task
                 observation = TimedObservation(
                     timestamp=time.time(),
-                    observation=raw_observation,
+                    observation=obs_with_task,
                     timestep=0,
                 )
                 self.send_observation(observation)
@@ -327,34 +375,37 @@ class RobotClient:
         return action
 
     def control_loop_action(self, timed_action, verbose: bool = False) -> dict[str, Any]:
-        """Reading and performing actions in local queue"""
-        with self.robot_lock:
-            _performed_action = self.robot.send_action(
-                self._action_tensor_to_action_dict(timed_action.get_action())
-            )
+        """Execute action on robot. Returns the action dict sent (pre-clip, like lerobot_record)."""
+        action_dict = self._action_tensor_to_action_dict(timed_action.get_action())
+        self.robot.send_action(action_dict)
         if verbose:
             raise NotImplementedError("Not implemented")
-            with self.action_queue_lock:
-                current_queue_size = self.action_queue.qsize()
 
-            self.logger.debug(
-                f"Ts={timed_action.get_timestamp()} | "
-                f"Action #{timed_action.get_timestep()} performed | "
-                f"Queue size: {current_queue_size}"
-            )
-
-            self.logger.debug(
-                f"Popping action from queue to perform took {get_end:.6f}s | Queue size: {current_queue_size}"
-            )
-
-        return _performed_action
+        return action_dict
 
     def control_loop_observation(self, verbose: bool = False) -> None:
         """Signal the observation_sender thread to capture and send one observation. Control loop does not block."""
         self.observation_requested.set()
 
+    def _reset_chunk_state(self):
+        """Reset action chunk state between episodes."""
+        with self.action_chunk_lock:
+            self.action_chunk = None
+            self.new_action_chunk = None
+        self.new_action_chunk_ready.clear()
+
     def control_loop(self, task: str, verbose: bool = False) -> tuple[Observation, Action]:
-        """Combined function for executing actions and streaming observations"""
+        """Combined function for executing actions and streaming observations.
+
+        Calls robot.get_observation() every iteration (like lerobot_record). The captured
+        observation is stored in self.latest_raw_obs before signaling the observation_sender
+        thread, so no lock is needed between them.
+
+        Keyboard controls (when dataset recording is active):
+          right arrow — finish episode and save, start next
+          left arrow  — discard episode buffer and rerecord
+          escape      — save current episode and stop
+        """
         # Wait at barrier for synchronized start
         self.start_barrier.wait()
         self.task = task
@@ -365,54 +416,91 @@ class RobotClient:
 
         chunk_idx = 0
 
+        input("Press Enter to start first episode...")
+
+        # Outer episode loop
         while self.running:
-            control_loop_start = time.perf_counter()
+            # --- inner per-step loop (one episode) ---
+            while self.running and not self.events["exit_early"]:
+                control_loop_start = time.perf_counter()
 
-            # Before the first action : wait
-            # [0 or latency, S) : do nothing and just execute action
-            # S : send observation
-            # (S, S+latency) : wait for action chunk and execute action in the previous chunk
-            # S+latency : change chunk and set the index to latency
-            # if waiting action chunk and action chunk is arrived:
-            # update action chunk, set index to the steps elapsed after sending observation
-            with self.action_chunk_lock:
-                action_chunk = self.action_chunk
-            if action_chunk is None:
-                self.logger.info("Action chunk ran out, waiting for new action chunk")
-                self.control_loop_observation(verbose)
-                self.new_action_chunk_ready.wait()
-                with self.action_chunk_lock:    
-                    action_chunk = self.new_action_chunk
-                    self.action_chunk = action_chunk
-                    self.new_action_chunk = None
-                    self.new_action_chunk_ready.clear()
-                chunk_idx = 0
+                # Capture observation every iteration (like lerobot_record)
+                raw_obs: RawObservation = self.robot.get_observation()
+                # Write before signaling — observation_sender reads after wait(), no lock needed
+                self.latest_raw_obs = raw_obs
 
-            if chunk_idx == self.commit_steps:
-                self.control_loop_observation(verbose)
-            elif self.commit_steps < chunk_idx < self.horizon:
-                if self.new_action_chunk_ready.is_set():
+                # Before the first action : wait
+                # [0 or latency, S) : do nothing and just execute action
+                # S : send observation
+                # (S, S+latency) : wait for action chunk and execute action in the previous chunk
+                # S+latency : change chunk and set the index to latency
+                # if waiting action chunk and action chunk is arrived:
+                # update action chunk, set index to the steps elapsed after sending observation
+                with self.action_chunk_lock:
+                    action_chunk = self.action_chunk
+                if action_chunk is None:
+                    self.logger.info("Action chunk ran out, waiting for new action chunk")
+                    self.control_loop_observation(verbose)
+                    self.new_action_chunk_ready.wait()
                     with self.action_chunk_lock:
-                        action_chunk = self.action_chunk = self.new_action_chunk
+                        action_chunk = self.new_action_chunk
+                        self.action_chunk = action_chunk
                         self.new_action_chunk = None
                         self.new_action_chunk_ready.clear()
-                    delay = chunk_idx - self.commit_steps # even if the action is ready within 1 step (S+1), the first action is skipped
-                    chunk_idx = delay
-                    self.logger.info(f"Action chunk is ready within delay {delay}steps, executing action")
+                    chunk_idx = 0
 
-            # Control robot
-            self.control_loop_action(action_chunk[chunk_idx], verbose)
+                if chunk_idx == self.commit_steps:
+                    self.control_loop_observation(verbose)
+                elif self.commit_steps < chunk_idx < self.horizon:
+                    if self.new_action_chunk_ready.is_set():
+                        with self.action_chunk_lock:
+                            action_chunk = self.action_chunk = self.new_action_chunk
+                            self.new_action_chunk = None
+                            self.new_action_chunk_ready.clear()
+                        delay = chunk_idx - self.commit_steps  # even if the action is ready within 1 step (S+1), the first action is skipped
+                        chunk_idx = delay
+                        self.logger.info(f"Action chunk is ready within delay {delay}steps, executing action")
 
-            chunk_idx += 1
+                # Control robot; get back action dict for dataset saving
+                action_dict = self.control_loop_action(action_chunk[chunk_idx], verbose)
+                _performed_action = action_dict
 
-            if chunk_idx == self.horizon:  # chunk ran out
-                with self.action_chunk_lock:
-                    self.action_chunk = None
-                chunk_idx = 0
+                # Save frame to dataset (if recording); reward=0 for all steps, patched at episode end
+                if self.dataset is not None:
+                    obs_frame = build_dataset_frame(self.dataset.features, raw_obs, prefix=OBS_STR)
+                    action_frame = build_dataset_frame(self.dataset.features, action_dict, prefix=ACTION)
+                    self.dataset.add_frame({**obs_frame, **action_frame, "task": task, "reward": np.array([0.0], dtype=np.float32)})
 
-            self.logger.debug(f"Control loop (ms): {(time.perf_counter() - control_loop_start) * 1000:.2f}")
-            # Dynamically adjust sleep time to maintain the desired control frequency
-            time.sleep(max(0, self.config.environment_dt - (time.perf_counter() - control_loop_start)))
+                chunk_idx += 1
+
+                if chunk_idx == self.horizon:  # chunk ran out
+                    with self.action_chunk_lock:
+                        self.action_chunk = None
+                    chunk_idx = 0
+
+                self.logger.debug(f"Control loop (ms): {(time.perf_counter() - control_loop_start) * 1000:.2f}")
+                # Dynamically adjust sleep time to maintain the desired control frequency
+                time.sleep(max(0, self.config.environment_dt - (time.perf_counter() - control_loop_start)))
+
+            # --- episode boundary ---
+            if self.events["stop_recording"]:
+                self.shutdown_event.set()
+
+            if self.dataset is not None:
+                if self.events["rerecord_episode"]:
+                    self.logger.info("Left arrow: discarding episode buffer, will rerecord")
+                    self.dataset.clear_episode_buffer()
+                else:
+                    reward = self._prompt_reward()
+                    self.dataset.episode_buffer["reward"][-1] = np.array([reward], dtype=np.float32)
+                    self.dataset.save_episode()
+                    self.logger.info(f"Episode {self.dataset.num_episodes} saved with reward={reward}")
+
+            # Reset flags and chunk state for the next episode
+            self.events["exit_early"] = False
+            self.events["rerecord_episode"] = False
+            self._reset_chunk_state()
+            chunk_idx = 0
 
         return _captured_observation, _performed_action
 

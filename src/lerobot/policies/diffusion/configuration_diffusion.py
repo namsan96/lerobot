@@ -125,6 +125,16 @@ class DiffusionConfig(PreTrainedConfig):
     diffusion_type: str = "diffusion"
     t_schedule: str | None = "beta0.999"
 
+    # DiT (Diffusion Transformer) option - uses GR00T-style DiT with DinoV3 tokens as conditioning.
+    use_dit: bool = False
+    dit_num_layers: int = 4
+    dit_num_attention_heads: int = 8
+    dit_attention_head_dim: int = 48
+    dit_embedding_hidden_dim: int = 256
+    dit_dropout: float = 0.1
+    dit_norm_type: str = "ada_norm"
+    dit_interleave_self_attention: bool = True
+
     # Architecture / modeling.
     # Vision backbone.
     vision_backbone: str = "resnet18"
@@ -159,6 +169,16 @@ class DiffusionConfig(PreTrainedConfig):
     # Loss computation
     do_mask_loss_for_padding: bool = False
 
+    # Critic / advantage-conditioned policy (DPPO-style)
+    use_critic: bool = False
+    critic_hidden_dims: tuple[int, ...] = (256, 256)
+    adv_embed_dim: int = 64        # size of binary advantage embedding appended to global_cond
+    adv_gamma: float = 0.99        # discount factor for return computation
+    gae_lambda: float = 0.95       # GAE lambda
+    adv_threshold_p: float = 0.1   # keep top X fraction as "high advantage" (adv_cond=1)
+    n_critic_steps: int = 5000     # gradient steps for critic training phase
+    critic_lr: float = 1e-4
+
     # Training presets
     optimizer_lr: float = 1e-4
     optimizer_betas: tuple = (0.95, 0.999)
@@ -184,13 +204,14 @@ class DiffusionConfig(PreTrainedConfig):
             )
 
         # Check that the horizon size and U-Net downsampling is compatible.
-        # U-Net downsamples by 2 with each stage.
-        downsampling_factor = 2 ** len(self.down_dims)
-        if self.horizon % downsampling_factor != 0:
-            raise ValueError(
-                "The horizon should be an integer multiple of the downsampling factor (which is determined "
-                f"by `len(down_dims)`). Got {self.horizon=} and {self.down_dims=}"
-            )
+        # U-Net downsamples by 2 with each stage. Skip this check for DiT, which doesn't use down_dims.
+        if not self.use_dit:
+            downsampling_factor = 2 ** len(self.down_dims)
+            if self.horizon % downsampling_factor != 0:
+                raise ValueError(
+                    "The horizon should be an integer multiple of the downsampling factor (which is determined "
+                    f"by `len(down_dims)`). Got {self.horizon=} and {self.down_dims=}"
+                )
 
     def get_optimizer_preset(self) -> AdamConfig:
         return AdamConfig(

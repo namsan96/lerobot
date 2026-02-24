@@ -19,6 +19,7 @@ from contextlib import nullcontext
 from pprint import pformat
 from typing import Any
 
+import numpy as np
 import torch
 from accelerate import Accelerator
 from termcolor import colored
@@ -121,6 +122,22 @@ def update_policy(
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
     return train_metrics, output_dict
+
+
+def update_critic(
+    policy: PreTrainedPolicy,
+    batch: Any,
+    critic_optimizer: torch.optim.Optimizer,
+    accelerator: Accelerator,
+) -> float:
+    """Single gradient step for the value critic (DPPO-style phase 1)."""
+    policy.train()
+    with accelerator.autocast():
+        loss, _ = policy.critic_forward(batch)
+    accelerator.backward(loss)
+    critic_optimizer.step()
+    critic_optimizer.zero_grad()
+    return loss.item()
 
 
 @parser.wrap()
@@ -291,6 +308,98 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         drop_last=False,
         prefetch_factor=2 if cfg.num_workers > 0 else None,
     )
+
+    # -------------------------------------------------------------------------
+    # DPPO two-phase training: critic pre-training + advantage-conditioned policy
+    # Runs before accelerator.prepare so the raw policy is used directly.
+    # -------------------------------------------------------------------------
+    if getattr(cfg.policy, "use_critic", False):
+        from lerobot.policies.diffusion.cfg_utils import (
+            CFGDatasetWrapper,
+            compute_advantages,
+            compute_returns,
+        )
+
+        wrapped_dataset = CFGDatasetWrapper(dataset)
+
+        # --- Phase 1: train critic on Monte-Carlo returns ---
+        if is_main_process:
+            logging.info("=== Critic training phase ===")
+
+        rets = compute_returns(dataset, cfg.policy.adv_gamma)
+        wrapped_dataset._rets = rets
+        wrapped_dataset.mode = "critic"
+
+        critic_dataloader = torch.utils.data.DataLoader(
+            wrapped_dataset,
+            num_workers=cfg.num_workers,
+            batch_size=cfg.batch_size,
+            shuffle=True,
+            pin_memory=device.type == "cuda",
+            drop_last=False,
+        )
+        critic_dl_iter = cycle(critic_dataloader)
+
+        critic_optimizer = torch.optim.Adam(
+            policy.diffusion.critic.parameters(),
+            lr=cfg.policy.critic_lr,
+        )
+
+        for critic_step in range(cfg.policy.n_critic_steps):
+            critic_batch = next(critic_dl_iter)
+            critic_batch = preprocessor(critic_batch)
+            closs = update_critic(policy, critic_batch, critic_optimizer, accelerator)
+            if is_main_process and cfg.log_freq > 0 and critic_step % cfg.log_freq == 0:
+                logging.info(f"  critic step {critic_step}/{cfg.policy.n_critic_steps}, loss={closs:.4f}")
+
+        # --- Phase 2: compute GAE advantages & label dataset ---
+        if is_main_process:
+            logging.info("=== Computing GAE advantages ===")
+
+        all_advs, threshold = compute_advantages(
+            dataset,
+            policy,
+            preprocessor,
+            cfg.policy.adv_gamma,
+            cfg.policy.gae_lambda,
+            cfg.policy.adv_threshold_p,
+            device,
+        )
+        wrapped_dataset._adv_conds = (all_advs > threshold).astype(np.int64)
+        wrapped_dataset.mode = "policy"
+
+        if is_main_process:
+            high_adv_frac = float(wrapped_dataset._adv_conds.mean())
+            logging.info(
+                f"=== Policy training phase: threshold={threshold:.4f}, "
+                f"high_adv_frac={high_adv_frac:.3f} ==="
+            )
+
+        # Replace dataset + dataloader with advantage-labelled version.
+        # accelerator.prepare below will wrap the new dataloader.
+        dataset = wrapped_dataset
+        if hasattr(cfg.policy, "drop_n_last_frames"):
+            policy_sampler = EpisodeAwareSampler(
+                dataset.meta.episodes["dataset_from_index"],
+                dataset.meta.episodes["dataset_to_index"],
+                drop_n_last_frames=cfg.policy.drop_n_last_frames,
+                shuffle=True,
+            )
+            policy_shuffle = False
+        else:
+            policy_sampler = None
+            policy_shuffle = True
+
+        dataloader = torch.utils.data.DataLoader(
+            dataset,
+            num_workers=cfg.num_workers,
+            batch_size=cfg.batch_size,
+            shuffle=policy_shuffle and not cfg.dataset.streaming,
+            sampler=policy_sampler,
+            pin_memory=device.type == "cuda",
+            drop_last=False,
+            prefetch_factor=2 if cfg.num_workers > 0 else None,
+        )
 
     # Prepare everything with accelerator
     accelerator.wait_for_everyone()

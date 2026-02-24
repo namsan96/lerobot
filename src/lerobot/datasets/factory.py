@@ -16,6 +16,8 @@
 import logging
 from pprint import pformat
 
+import numpy as np
+import pandas as pd
 import torch
 
 from lerobot.configs.policies import PreTrainedConfig
@@ -28,6 +30,58 @@ from lerobot.datasets.lerobot_dataset import (
 from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
 from lerobot.datasets.transforms import ImageTransforms
 from lerobot.utils.constants import ACTION, OBS_PREFIX, REWARD
+
+class _ConcatHfProxy:
+    """Minimal proxy that concatenates hf_dataset column access across multiple datasets.
+
+    A column is exposed only if ALL underlying datasets contain it; otherwise the column
+    is absent (callers that check `column_names` will use their fallback path).
+    """
+
+    def __init__(self, hf_datasets):
+        self._datasets = hf_datasets
+        common = set(hf_datasets[0].column_names)
+        for ds in hf_datasets[1:]:
+            common &= set(ds.column_names)
+        self.column_names = list(common)
+
+    def __getitem__(self, key):
+        return np.concatenate([np.array(ds[key]) for ds in self._datasets])
+
+
+class _ConcatMeta:
+    """Minimal meta object that aggregates episode indices and exposes primary-dataset stats."""
+
+    def __init__(self, datasets):
+        self.stats = datasets[0].meta.stats
+        self.camera_keys = datasets[0].meta.camera_keys
+
+        offset = 0
+        ep_frames = []
+        for ds in datasets:
+            ep_df = ds.meta.episodes.copy()
+            ep_df["dataset_from_index"] = ep_df["dataset_from_index"] + offset
+            ep_df["dataset_to_index"] = ep_df["dataset_to_index"] + offset
+            ep_frames.append(ep_df)
+            offset += ds.num_frames
+        self.episodes = pd.concat(ep_frames, ignore_index=True)
+
+
+class ConcatLeRobotDataset(torch.utils.data.ConcatDataset):
+    """Concatenation of multiple LeRobotDataset instances with a unified interface.
+
+    Inherits __len__ and __getitem__ routing from torch.utils.data.ConcatDataset.
+    Adds the attributes needed by EpisodeAwareSampler, MetricsTracker, and cfg_utils.
+    Stats and camera_keys are taken from the first (primary) dataset.
+    """
+
+    def __init__(self, datasets):
+        super().__init__(datasets)
+        self.num_frames = len(self)
+        self.num_episodes = sum(ds.num_episodes for ds in datasets)
+        self.meta = _ConcatMeta(datasets)
+        self.hf_dataset = _ConcatHfProxy([ds.hf_dataset for ds in datasets])
+
 
 IMAGENET_STATS = {
     "mean": [[[0.485]], [[0.456]], [[0.406]]],  # (c,1,1)
@@ -129,5 +183,30 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         for key in dataset.meta.camera_keys:
             for stats_type, stats in IMAGENET_STATS.items():
                 dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
+
+    extra_repo_ids = getattr(cfg.dataset, "extra_repo_ids", None)
+    if extra_repo_ids:
+        extra_datasets = []
+        for extra_repo_id in extra_repo_ids:
+            extra_meta = LeRobotDatasetMetadata(
+                extra_repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
+            )
+            extra_delta_timestamps = resolve_delta_timestamps(cfg.policy, extra_meta)
+            extra_ds = LeRobotDataset(
+                extra_repo_id,
+                root=cfg.dataset.root,
+                delta_timestamps=extra_delta_timestamps,
+                image_transforms=image_transforms,
+                revision=cfg.dataset.revision,
+                video_backend=cfg.dataset.video_backend,
+                cache_videos=cfg.dataset.cache_videos,
+                cache_video_resize=cfg.dataset.cache_video_resize,
+            )
+            extra_datasets.append(extra_ds)
+            logging.info(f"Concatenating extra dataset: {extra_repo_id} ({extra_ds.num_frames} frames)")
+        dataset = ConcatLeRobotDataset([dataset] + extra_datasets)
+        logging.info(
+            f"Total concatenated dataset: {dataset.num_frames} frames, {dataset.num_episodes} episodes"
+        )
 
     return dataset

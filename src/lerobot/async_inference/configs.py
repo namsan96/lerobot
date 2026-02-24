@@ -150,6 +150,19 @@ class RobotClientConfig:
 
     commit_steps: int = field(default=10, metadata={"help": "Number of steps to commit at once"})
 
+    # Dataset recording (optional — if dataset_repo_id is set, frames are saved to a LeRobotDataset)
+    dataset_repo_id: str | None = field(
+        default=None, metadata={"help": "Dataset repo ID for recording. If None, no dataset is saved."}
+    )
+    dataset_root: str | None = field(default=None, metadata={"help": "Root directory for dataset storage."})
+    dataset_video: bool = field(default=False, metadata={"help": "Encode camera frames as video."})
+    dataset_num_image_writer_processes: int = field(
+        default=0, metadata={"help": "Number of subprocesses for image writing."}
+    )
+    dataset_num_image_writer_threads_per_camera: int = field(
+        default=4, metadata={"help": "Number of threads per camera for image writing."}
+    )
+
     # Populated from CLI --policy.xxx by the client entrypoint; sent to server so policy is loaded with same overrides.
     policy_cli_overrides: list[str] = field(
         default_factory=list,
