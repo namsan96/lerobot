@@ -260,7 +260,34 @@ class SO101Follower(Robot):
         for motor in self.bus.motors:
             self.bus.write("Acceleration", motor, acceleration, normalize=False)
 
+        # Waypoint: move to intermediate position first
+        current_pos = self.bus.sync_read("Present_Position")
+        waypoint = {
+            "shoulder_pan": current_pos["shoulder_pan"],
+            "shoulder_lift": -100.0,
+            "elbow_flex": 45.0,
+            "wrist_flex": 0.0,
+            "wrist_roll": 0.0,
+            "gripper": 50.0,
+        }
+        logger.info(f"Moving {self} to waypoint position...")
+        self.bus.sync_write("Goal_Position", waypoint)
+
+        start = time.perf_counter()
+        while time.perf_counter() - start < timeout_s:
+            present_pos = self.bus.sync_read("Present_Position")
+            if all(abs(present_pos[m] - waypoint[m]) <= pos_tol for m in waypoint):
+                logger.info(f"{self} reached waypoint position.")
+                break
+            time.sleep(poll_period_s)
+        else:
+            logger.warning(
+                f"{self} did not fully reach waypoint position within {timeout_s}s. "
+                "Continuing to home position anyway."
+            )
+
         # Command the home goal positions (normalized units, same as send_action)
+        logger.info(f"Moving {self} to final home position...")
         self.bus.sync_write("Goal_Position", self.HOME_POS)
 
         # Poll until all joints converge or the timeout fires
