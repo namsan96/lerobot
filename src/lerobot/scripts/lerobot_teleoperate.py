@@ -104,6 +104,7 @@ class TeleoperateConfig:
     teleop_time_s: float | None = None
     # Display all cameras on screen
     display_data: bool = False
+    go_home_on_shutdown: bool = False
 
 
 def teleop_loop(
@@ -211,6 +212,8 @@ def teleoperate(cfg: TeleoperateConfig):
     finally:
         if cfg.display_data:
             rr.rerun_shutdown()
+        if cfg.go_home_on_shutdown:
+            robot.go_to_home()
         teleop.disconnect()
         robot.disconnect()
 

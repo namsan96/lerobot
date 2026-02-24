@@ -42,6 +42,16 @@ class SO101Follower(Robot):
     config_class = SO101FollowerConfig
     name = "so101_follower"
 
+    # Normalized home position (RANGE_M100_100 for body joints, RANGE_0_100 for gripper)
+    HOME_POS: dict[str, float] = {
+        "shoulder_pan": 0.0,
+        "shoulder_lift": -100.0,
+        "elbow_flex": 100.0,
+        "wrist_flex": 40.0,
+        "wrist_roll": 0.0,
+        "gripper": 50.0,
+    }
+
     def __init__(self, config: SO101FollowerConfig):
         super().__init__(config)
         self.config = config
@@ -218,6 +228,58 @@ class SO101Follower(Robot):
         # Send goal position to the arm
         self.bus.sync_write("Goal_Position", goal_pos)
         return {f"{motor}.pos": val for motor, val in goal_pos.items()}
+
+    def go_to_home(
+        self,
+        acceleration: int = 10,
+        timeout_s: float = 15.0,
+        poll_period_s: float = 0.1,
+        pos_tol: float = 2.0,
+    ) -> None:
+        """Slowly move the arm to the home/rest position.
+
+        Sets a low Acceleration value on every motor before issuing the home
+        goal position, then polls Present_Position until all joints converge
+        (or until timeout_s expires). Acceleration is restored to 254
+        (hardware default) after the move completes.
+
+        Args:
+            acceleration: Raw value written to the Acceleration register of
+                every motor (range 1-254; lower → gentler ramp-up; 254 = hardware default).
+            timeout_s: Maximum time (seconds) to wait for all joints to arrive.
+            poll_period_s: Interval (seconds) between position-check polls.
+            pos_tol: Convergence threshold in normalized units — a motor is
+                considered "at home" when |present - home| <= pos_tol.
+        """
+        if not self.is_connected:
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+
+        logger.info(f"Moving {self} to home position (acceleration={acceleration})...")
+
+        # Limit acceleration on every motor so the movement is gradual
+        for motor in self.bus.motors:
+            self.bus.write("Acceleration", motor, acceleration, normalize=False)
+
+        # Command the home goal positions (normalized units, same as send_action)
+        self.bus.sync_write("Goal_Position", self.HOME_POS)
+
+        # Poll until all joints converge or the timeout fires
+        start = time.perf_counter()
+        while time.perf_counter() - start < timeout_s:
+            present_pos = self.bus.sync_read("Present_Position")
+            if all(abs(present_pos[m] - self.HOME_POS[m]) <= pos_tol for m in self.HOME_POS):
+                logger.info(f"{self} reached home position.")
+                break
+            time.sleep(poll_period_s)
+        else:
+            logger.warning(
+                f"{self} did not fully reach home position within {timeout_s}s. "
+                "Check for obstructions or increase timeout_s."
+            )
+
+        # Restore hardware default acceleration (254)
+        for motor in self.bus.motors:
+            self.bus.write("Acceleration", motor, 254, normalize=False)
 
     def disconnect(self):
         if not self.is_connected:
