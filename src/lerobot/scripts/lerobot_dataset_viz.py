@@ -169,8 +169,10 @@ def visualize_dataset(
             if DONE in batch:
                 rr.log(DONE, rr.Scalars(batch[DONE][i].item()))
 
-            if REWARD in batch:
-                rr.log(REWARD, rr.Scalars(batch[REWARD][i].item()))
+            for reward_key in (REWARD, "reward"):
+                if reward_key in batch:
+                    rr.log(reward_key, rr.Scalars(batch[reward_key][i].item()))
+                    break
 
             if "next.success" in batch:
                 rr.log("next.success", rr.Scalars(batch["next.success"][i].item()))
