@@ -150,7 +150,7 @@ class RobotClient:
             self.dataset = LeRobotDataset.create(
                 config.dataset_repo_id,
                 config.fps,
-                root=config.dataset_root,
+                # root=config.dataset_root,
                 robot_type=self.robot.name,
                 features=dataset_features,
                 use_videos=config.dataset_video,
@@ -172,7 +172,7 @@ class RobotClient:
     def _make_dataset_features(self, use_videos: bool) -> dict:
         obs_features = hw_to_dataset_features(self.robot.observation_features, OBS_STR, use_video=use_videos)
         action_features = hw_to_dataset_features(self.robot.action_features, ACTION, use_video=use_videos)
-        reward_feature = {"reward": {"dtype": "float32", "shape": (1,), "names": None}}
+        reward_feature = {"reward": {"dtype": "float32", "shape": (1,), "names": ["reward"]}}
         return combine_feature_dicts(obs_features, action_features, reward_feature)
 
     def _prompt_reward(self) -> float:
@@ -231,6 +231,8 @@ class RobotClient:
 
         if self.listener is not None:
             self.listener.stop()
+        
+        self.robot.go_to_home()
 
         self.robot.disconnect()
         self.logger.debug("Robot disconnected")
@@ -416,6 +418,7 @@ class RobotClient:
 
         chunk_idx = 0
 
+        self.robot.go_to_home()
         input("Press Enter to start first episode...")
 
         # Outer episode loop
@@ -485,8 +488,10 @@ class RobotClient:
             # --- episode boundary ---
             if self.events["stop_recording"]:
                 self.shutdown_event.set()
+            self.robot.go_to_home()
 
             if self.dataset is not None:
+                print(f"Current episode index: {self.dataset.num_episodes}")
                 if self.events["rerecord_episode"]:
                     self.logger.info("Left arrow: discarding episode buffer, will rerecord")
                     self.dataset.clear_episode_buffer()
@@ -495,6 +500,9 @@ class RobotClient:
                     self.dataset.episode_buffer["reward"][-1] = np.array([reward], dtype=np.float32)
                     self.dataset.save_episode()
                     self.logger.info(f"Episode {self.dataset.num_episodes} saved with reward={reward}")
+                    input("Enter to start next episode")
+            else:
+                input("Enter to restart")
 
             # Reset flags and chunk state for the next episode
             self.events["exit_early"] = False
