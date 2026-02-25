@@ -166,14 +166,20 @@ class RobotClient:
 
         self.logger.info("Robot connected and ready")
 
-        self.horizon = self.config.actions_per_chunk
+        # e.g. downsample = 4 => a3, a7, ...
+        # chunk 7 => horizon 1 / chunk 8 => horizon 2
+        self.horizon = self.config.actions_per_chunk //self.config.downsample
         self.commit_steps = self.config.commit_steps
 
     def _make_dataset_features(self, use_videos: bool) -> dict:
         obs_features = hw_to_dataset_features(self.robot.observation_features, OBS_STR, use_video=use_videos)
         action_features = hw_to_dataset_features(self.robot.action_features, ACTION, use_video=use_videos)
         reward_feature = {"reward": {"dtype": "float32", "shape": (1,), "names": ["reward"]}}
-        return combine_feature_dicts(obs_features, action_features, reward_feature)
+        debug_features = {
+            "debug.elapsed_ms": {"dtype": "float32", "shape": (1,), "names": ["elapsed_ms"]},
+            "debug.chunk_idx": {"dtype": "float32", "shape": (1,), "names": ["chunk_idx"]},
+        }
+        return combine_feature_dicts(obs_features, action_features, reward_feature, debug_features)
 
     def _prompt_reward(self) -> float:
         while True:
@@ -317,6 +323,10 @@ class RobotClient:
                 deserialize_start = time.perf_counter()
                 timed_actions = pickle.loads(actions_chunk.data)  # nosec
                 deserialize_time = time.perf_counter() - deserialize_start
+
+                # DOWNSAMPLING
+                ds = self.config.downsample
+                timed_actions = timed_actions[ds-1::ds]
 
                 with self.action_chunk_lock:
                     self.new_action_chunk = timed_actions
@@ -472,7 +482,15 @@ class RobotClient:
                 if self.dataset is not None:
                     obs_frame = build_dataset_frame(self.dataset.features, raw_obs, prefix=OBS_STR)
                     action_frame = build_dataset_frame(self.dataset.features, action_dict, prefix=ACTION)
-                    self.dataset.add_frame({**obs_frame, **action_frame, "task": task, "reward": np.array([0.0], dtype=np.float32)})
+                    elapsed_ms = (time.perf_counter() - control_loop_start) * 1000
+                    self.dataset.add_frame({
+                        **obs_frame,
+                        **action_frame,
+                        "task": task,
+                        "reward": np.array([0.0], dtype=np.float32),
+                        "debug.elapsed_ms": np.array([elapsed_ms], dtype=np.float32),
+                        "debug.chunk_idx": np.array([chunk_idx], dtype=np.float32),
+                    })
 
                 chunk_idx += 1
 
