@@ -169,6 +169,10 @@ class DiffusionConfig(PreTrainedConfig):
     # Loss computation
     do_mask_loss_for_padding: bool = False
 
+    # RTC inference type (e.g. "action_cond"). None means standard inference.
+    rtc_type: str | None = None
+    rtc_delay: int | None = None
+
     # Critic / advantage-conditioned policy (DPPO-style)
     use_critic: bool = False
     critic_hidden_dims: tuple[int, ...] = (256, 256)

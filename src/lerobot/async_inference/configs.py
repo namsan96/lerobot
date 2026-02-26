@@ -151,6 +151,9 @@ class RobotClientConfig:
 
     commit_steps: int = field(default=10, metadata={"help": "Number of steps to commit at once"})
 
+    # If True, sends commit_steps to the server so it uses action_cond for the next inference call.
+    use_action_cond: bool = field(default=False, metadata={"help": "If True, the server uses action_cond=last_chunk[commit_steps:] on each inference call (policy must support it)."})
+
     # Dataset recording (optional — if dataset_repo_id is set, frames are saved to a LeRobotDataset)
     dataset_repo_id: str | None = field(
         default=None, metadata={"help": "Dataset repo ID for recording. If None, no dataset is saved."}

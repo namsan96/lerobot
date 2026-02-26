@@ -95,11 +95,11 @@ class DiffusionPolicy(PreTrainedPolicy):
             self._queues[OBS_ENV_STATE] = deque(maxlen=self.config.n_obs_steps)
 
     @torch.no_grad()
-    def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None, full_length: bool = False) -> Tensor:
+    def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None, full_length: bool = False, action_cond=None) -> Tensor:
         """Predict a chunk of actions given environment observations."""
         # stack n latest observations from the queue
         batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
-        actions = self.diffusion.generate_actions(batch, noise=noise, full_length=full_length)
+        actions = self.diffusion.generate_actions(batch, noise=noise, full_length=full_length, action_cond=action_cond)
 
         return actions
 
@@ -273,9 +273,13 @@ class DiffusionModel(nn.Module):
         global_cond: Tensor | None = None,
         generator: torch.Generator | None = None,
         noise: Tensor | None = None,
+        action_cond=None,
     ) -> Tensor:
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
+
+        if action_cond is not None:
+            raise NotImplementedError
 
         # Sample prior.
         sample = (
@@ -403,7 +407,7 @@ class DiffusionModel(nn.Module):
             global_cond = torch.cat([global_cond, adv_embed], dim=-1)
         return global_cond
 
-    def generate_actions(self, batch: dict[str, Tensor], noise: Tensor | None = None, full_length: bool = False) -> Tensor:
+    def generate_actions(self, batch: dict[str, Tensor], noise: Tensor | None = None, full_length: bool = False, action_cond=None) -> Tensor:
         """
         This function expects `batch` to have:
         {
@@ -421,7 +425,7 @@ class DiffusionModel(nn.Module):
         global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
 
         # run sampling
-        actions = self.conditional_sample(batch_size, global_cond=global_cond, noise=noise)
+        actions = self.conditional_sample(batch_size, global_cond=global_cond, noise=noise, action_cond=action_cond)
 
         # Extract `n_action_steps` steps worth of actions (from the current observation).
         start = n_obs_steps - 1
@@ -515,6 +519,7 @@ class FlowModel(DiffusionModel):
         global_cond: Tensor | None = None,
         generator: torch.Generator | None = None,
         noise: Tensor | None = None,
+        action_cond=None
     ) -> Tensor:
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
@@ -536,12 +541,57 @@ class FlowModel(DiffusionModel):
         for i in range(self.num_inference_steps):
             # Flow matching: t in [0, 1). UNet expects continuous timestep (same as in compute_loss).
             tau = i / self.num_inference_steps
-            model_output = self.unet(
-                sample,
-                torch.full(sample.shape[:1], tau, dtype=dtype, device=sample.device),
-                global_cond=global_cond,
-            )
-            sample = sample + model_output / self.num_inference_steps
+            taus = torch.full(sample.shape[:1], tau, dtype=dtype, device=sample.device)
+
+            if action_cond is not None and self.config.rtc_type == 'inference_time_soft':
+                assert batch_size == action_cond.shape[0] == 1, "Batch is not suported"
+                # Preparations.
+                single_action_cond = action_cond.squeeze(0)
+                commit_step = len(single_action_cond)
+                single_action_cond = torch.cat([
+                    single_action_cond,
+                    torch.zeros(self.config.horizon - len(single_action_cond), sample.shape[-1], device=single_action_cond.device)
+                ])
+                tau = np.array(tau)
+                coeff = (1 - tau) / (
+                    tau * (1 - tau) ** 2 / (
+                        tau**2 + (1 - tau) ** 2
+                    )
+                )
+                soft_interval = (self.config.rtc_delay, self.config.horizon - commit_step)
+                a, b = soft_interval
+                indices = torch.arange(self.config.horizon, device=sample.device)
+                linear_c = (b - indices) / (b - a + 1)
+                exp_c = linear_c * (torch.exp(linear_c) - 1) / (np.e - 1)
+                
+                single_inpaint_mask = exp_c
+                single_inpaint_mask[:a] = 1
+                single_inpaint_mask[b:] = 0
+
+                # (Y-A1)^T diag(W)  X   dA_1 / dA_tau
+                def single_a_1_fn(single_a_tau):
+                    single_vel = self.unet(single_a_tau.unsqueeze(0), taus, global_cond=global_cond).squeeze(0)
+                    single_a_1 = single_a_tau + (1 - tau) * single_vel
+                    return single_a_1, single_vel
+                single_a_tau = sample.squeeze(0)
+                with torch.enable_grad():
+                    single_a_1, vjp_fn, single_vel = torch.func.vjp(
+                        single_a_1_fn, single_a_tau, has_aux=True
+                    )
+                    single_masked_error = (single_action_cond - single_a_1) * single_inpaint_mask[:, None]
+                    single_guidance = vjp_fn(single_masked_error)[0]
+
+                coeff = min(5, coeff)
+                vel = (single_vel + coeff * single_guidance).unsqueeze(0)
+
+            else:
+                vel = self.unet(
+                    sample,
+                    taus,
+                    global_cond=global_cond,
+                )
+
+            sample = sample + vel / self.num_inference_steps
         return sample
 
     def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:

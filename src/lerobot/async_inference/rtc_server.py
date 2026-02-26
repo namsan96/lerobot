@@ -92,6 +92,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None
         self.postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None
 
+        # Last action chunk for action-conditioned inference (set when commit_steps is configured)
+        self.last_action_chunk: torch.Tensor | None = None
+
     @property
     def running(self):
         return not self.shutdown_event.is_set()
@@ -108,6 +111,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         with self._predicted_timesteps_lock:
             self._predicted_timesteps = set()
+
+        self.last_action_chunk = None
 
     def Ready(self, request, context):  # noqa: N802
         client_id = context.peer()
@@ -343,11 +348,22 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                     [batch[k] for k in self.policy.config.image_features], dim=-4
                 )
             self.policy._queues = populate_queues(self.policy._queues, batch)
-        chunk = self.policy.predict_action_chunk(batch, full_length=True)
+
+        kwargs = {}
+        if self.commit_steps is not None and self.last_action_chunk is not None:
+            kwargs["action_cond"] = self.last_action_chunk[:, self.commit_steps:, :].unsqueeze(0)
+
+        chunk = self.policy.predict_action_chunk(batch, full_length=True, **kwargs)
         if chunk.ndim != 3:
             chunk = chunk.unsqueeze(0)  # adding batch dimension, now shape is (B, chunk_size, action_dim)
 
-        return chunk[:, : self.actions_per_chunk, :]
+        chunk = chunk[:, : self.actions_per_chunk, :]
+
+        # Save for action-conditioned inference on next call
+        if self.commit_steps is not None:
+            self.last_action_chunk = chunk
+
+        return chunk
 
     def _predict_action_chunk(self, observation_t: TimedObservation) -> list[TimedAction]:
         """Predict an action chunk based on an observation.

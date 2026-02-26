@@ -117,7 +117,7 @@ class RobotClient:
             actions_per_chunk=config.actions_per_chunk,
             device=config.policy_device,
             rename_map=getattr(config, "rename_map", {}),
-            commit_steps=getattr(config, "commit_steps", None),
+            commit_steps=config.commit_steps if getattr(config, "use_action_cond", False) else None,
             policy_cli_overrides=getattr(config, "policy_cli_overrides", None) or [],
         )
         self.channel = grpc.insecure_channel(
