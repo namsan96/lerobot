@@ -154,7 +154,10 @@ def visualize_dataset(
             # display each camera image
             for key in dataset.meta.camera_keys:
                 # TODO(rcadene): add `.compress()`? is it lossless?
-                rr.log(key, rr.Image(to_hwc_uint8_numpy(batch[key][i])))
+                img = batch[key][i]
+                if img.ndim == 4:
+                    img = img[-1]  # (n_obs_steps, C, H, W) -> take current step
+                rr.log(key, rr.Image(to_hwc_uint8_numpy(img)))
 
             # display each dimension of action space (e.g. actuators command)
             if ACTION in batch:

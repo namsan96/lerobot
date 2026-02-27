@@ -351,7 +351,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         kwargs = {}
         if self.commit_steps is not None and self.last_action_chunk is not None:
-            kwargs["action_cond"] = self.last_action_chunk[:, self.commit_steps:, :].unsqueeze(0)
+            kwargs["action_cond"] = self.last_action_chunk[:, self.commit_steps:, :]
 
         chunk = self.policy.predict_action_chunk(batch, full_length=True, **kwargs)
         if chunk.ndim != 3:
