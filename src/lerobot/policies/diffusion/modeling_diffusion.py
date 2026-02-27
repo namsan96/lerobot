@@ -20,6 +20,7 @@ TODO(alexander-soare):
   - Remove reliance on diffusers for DDPMScheduler and LR scheduler.
 """
 
+from asyncio import Condition
 import math
 from collections import deque
 from collections.abc import Callable
@@ -513,6 +514,12 @@ class FlowModel(DiffusionModel):
     def __init__(self, config: DiffusionConfig):
         super().__init__(config)
 
+    def _legato_step(self, sample, global_cond, action_cond):
+        conditioned_sample = (1-w) * sample + w * conditioned_sample
+        vel = self.unet(conditioned_sample, taus, global_cond=global_cond).squeeze(0)
+        return sample + vel / self.num_inference_steps
+
+
     def conditional_sample(
         self,
         batch_size: int,
@@ -584,6 +591,17 @@ class FlowModel(DiffusionModel):
                 coeff = min(5, coeff)
                 vel = (single_vel + coeff * single_guidance).unsqueeze(0)
 
+            elif self.config.rtc_type == "train_time":
+                B, H = sample.shape[:2]
+                # Inpaint prefix before each model call, matching JAX sample_actions.
+                if action_cond is not None:
+                    sample[:, :self.config.rtc_delay] = action_cond
+                taus_per_step = taus.unsqueeze(1).expand(B, H).clone()  # (B, H)
+                taus_per_step[:, :self.config.rtc_delay] = 1.0
+                vel = self.unet(sample, taus_per_step, global_cond=global_cond)
+
+            elif self.config.rtc_type == "legato":
+                pass
             else:
                 vel = self.unet(
                     sample,
@@ -611,25 +629,43 @@ class FlowModel(DiffusionModel):
         eps = torch.randn(trajectory.shape, device=trajectory.device)
 
         B = trajectory.shape[0]
+        H = trajectory.shape[1]
         device = trajectory.device
 
         if self.config.t_schedule is None:
-            timesteps = torch.rand(B, device=device)[:, None, None]
+            timesteps = torch.rand(B, device=device)[:, None].expand(B, H).clone()  # (B, H)
         elif self.config.t_schedule == 'beta0.999':
             z = torch.distributions.Beta(1.5, 1).sample((B,)).to(device)
-            timesteps = 0.999 * (1 - z)
-            timesteps = timesteps[:, None, None]
+            t = 0.999 * (1 - z)
+            timesteps = t[:, None].expand(B, H).clone()  # (B, H)
 
-        noisy_trajectory = (1 - timesteps) * eps + timesteps * trajectory
+        noisy_trajectory = (1 - timesteps.unsqueeze(-1)) * eps + timesteps.unsqueeze(-1) * trajectory
 
         vel = trajectory - eps
-        pred = self.unet(noisy_trajectory, timesteps[:, 0, 0], global_cond=global_cond)
-        loss = F.mse_loss(pred, vel)
+
+        if self.config.rtc_type == "train_time":
+            d = torch.randint(0, self.config.rtc_delay, (B,), device=device)
+            # mask[b, h] = True if h < d[b], shape (B, H)
+            h_idx = torch.arange(H, device=device).unsqueeze(0)
+            mask = h_idx < d.unsqueeze(1)  # (B, H)
+            max_t = 1.0 if self.config.t_schedule is None else 0.999
+            timesteps = timesteps.masked_fill(mask, max_t)
+            noisy_trajectory = torch.where(mask.unsqueeze(-1).expand_as(trajectory), trajectory, noisy_trajectory)
+
+        pred = self.unet(noisy_trajectory, timesteps, global_cond=global_cond)
+
+        if self.config.rtc_type == "train_time":
+            # Loss only on non-fixed steps; normalize by unmasked count to preserve scale.
+            loss_elem = F.mse_loss(pred, vel, reduction='none')  # (B, H, action_dim)
+            unmasked = (~mask).unsqueeze(-1).expand_as(loss_elem)
+            loss = loss_elem[unmasked].mean() * (B * H) / (~mask).sum()
+        else:
+            loss = F.mse_loss(pred, vel)
 
         if self.config.do_mask_loss_for_padding:
             raise NotImplementedError("Mask loss for padding is not implemented for flow model")
 
-        return loss.mean()
+        return loss
 
 
 class SpatialSoftmax(nn.Module):
@@ -1127,14 +1163,19 @@ class Gr00tDiTUnetWrapper(nn.Module):
         state = global_cond["state"]
         B, T, _ = x.shape
 
+        if isinstance(timestep, int):
+            timestep = torch.full((B,), timestep, device=x.device, dtype=torch.float32)
+        if timestep.dim() == 2:
+            # (B, H) per-step timesteps: prepend the last step's timestep for the state token.
+            # The last action step is never in the inpainting region, so it always holds the base t.
+            timestep = torch.cat([timestep[:, -1:], timestep], dim=1)  # (B, 1+H)
+
         state_embed = self.state_encoder(state).unsqueeze(1)
         action_embed = self.action_encoder(x)
         pos_ids = torch.arange(T, dtype=torch.long, device=x.device)
         action_embed = action_embed + self.action_position_embedding(pos_ids).unsqueeze(0)
         hidden_states = torch.cat([state_embed, action_embed], dim=1)
 
-        if isinstance(timestep, int):
-            timestep = torch.full((B,), timestep, device=x.device, dtype=torch.long)
         out = self.dit(
             hidden_states,
             encoder_hidden_states=encoder_tokens,
