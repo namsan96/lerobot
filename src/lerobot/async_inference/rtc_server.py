@@ -25,11 +25,13 @@ python -m lerobot.async_inference.policy_server \
 """
 
 import logging
+import os
 import pickle  # nosec
 import threading
 import time
 from concurrent import futures
 from dataclasses import asdict
+from pathlib import Path
 from pprint import pformat
 from queue import Empty, Queue
 from typing import Any
@@ -52,7 +54,6 @@ from lerobot.transport import (
 from lerobot.transport.utils import receive_bytes_in_chunks
 
 from .configs import PolicyServerConfig
-from .constants import SUPPORTED_POLICIES
 from .helpers import (
     FPSTracker,
     Observation,
@@ -83,17 +84,52 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         self.last_processed_obs = None
 
-        # Attributes will be set by SendPolicyInstructions
-        self.device = None
-        self.policy_type = None
+        # Lock protecting policy weights during hot-swap from ft_learner
+        self._policy_lock = threading.Lock()
+        self._weights_watcher_thread: threading.Thread | None = None
+
+        # Session-specific config (set by SendPolicyInstructions)
         self.lerobot_features = None
         self.actions_per_chunk = None
-        self.policy = None
+        self.commit_steps = None
         self.preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None
         self.postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None
 
         # Last action chunk for action-conditioned inference (set when commit_steps is configured)
         self.last_action_chunk: torch.Tensor | None = None
+
+        # Load policy at server startup
+        self.device = config.device
+        self.policy_type = config.policy_type
+        cli_overrides = getattr(config, "policy_cli_overrides", None) or []
+        policy_class = get_policy_class(config.policy_type)
+        self.logger.info(
+            f"Loading policy '{config.policy_type}' from '{config.pretrained_name_or_path}' on {config.device}"
+            + (f" with overrides {cli_overrides}" if cli_overrides else "")
+        )
+        start = time.perf_counter()
+        self.policy = policy_class.from_pretrained(
+            config.pretrained_name_or_path,
+            cli_overrides=cli_overrides,
+        )
+        self.policy.to(config.device)
+        self.policy.eval()
+        self.logger.info(f"Policy loaded in {time.perf_counter() - start:.2f}s")
+
+        # Build preprocessor/postprocessor with empty rename_map; updated per-session in SendPolicyInstructions
+        device_override = {"device": config.device}
+        self.preprocessor, self.postprocessor = make_pre_post_processors(
+            self.policy.config,
+            pretrained_path=config.pretrained_name_or_path,
+            preprocessor_overrides={
+                "device_processor": device_override,
+                "rename_observations_processor": {"rename_map": {}},
+            },
+            postprocessor_overrides={"device_processor": device_override},
+        )
+
+        if config.weights_watch_dir is not None:
+            self._start_weights_watcher()
 
     @property
     def running(self):
@@ -123,70 +159,42 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         return services_pb2.Empty()
 
     def SendPolicyInstructions(self, request, context):  # noqa: N802
-        """Receive policy instructions from the robot client"""
+        """Receive session-specific config from the robot client.
 
+        Policy is already loaded at server startup; this only updates per-session
+        parameters: lerobot_features, actions_per_chunk, commit_steps, rename_map.
+        """
         if not self.running:
             self.logger.warning("Server is not running. Ignoring policy instructions.")
             return services_pb2.Empty()
 
         client_id = context.peer()
-
         policy_specs = pickle.loads(request.data)  # nosec
 
         if not isinstance(policy_specs, RemotePolicyConfig):
             raise TypeError(f"Policy specs must be a RemotePolicyConfig. Got {type(policy_specs)}")
 
-        if policy_specs.policy_type not in SUPPORTED_POLICIES:
-            raise ValueError(
-                f"Policy type {policy_specs.policy_type} not supported. "
-                f"Supported policies: {SUPPORTED_POLICIES}"
-            )
-
-        client_overrides = getattr(policy_specs, "policy_cli_overrides", None) or []
-        server_overrides = getattr(self.config, "policy_cli_overrides", None) or []
-        cli_overrides = client_overrides + server_overrides
-        if server_overrides:
-            self.logger.info(f"Server policy overrides (from CLI): {server_overrides}")
         self.logger.info(
-            f"Receiving policy instructions from {client_id} | "
-            f"Policy type: {policy_specs.policy_type} | "
-            f"Pretrained name or path: {policy_specs.pretrained_name_or_path} | "
+            f"Receiving session config from {client_id} | "
             f"Actions per chunk: {policy_specs.actions_per_chunk} | "
-            f"Device: {policy_specs.device}"
-            + (f" | CLI overrides: {cli_overrides}" if cli_overrides else "")
+            f"Commit steps: {policy_specs.commit_steps}"
         )
 
-        self.device = policy_specs.device
-        self.policy_type = policy_specs.policy_type  # act, pi0, etc.
         self.lerobot_features = policy_specs.lerobot_features
         self.actions_per_chunk = policy_specs.actions_per_chunk
         self.commit_steps = policy_specs.commit_steps
 
-        policy_class = get_policy_class(self.policy_type)
-
-        start = time.perf_counter()
-        self.policy = policy_class.from_pretrained(
-            policy_specs.pretrained_name_or_path,
-            cli_overrides=cli_overrides,
-        )
-        self.policy.to(self.device)
-        self.policy.eval()
-
-        # Load preprocessor and postprocessor, overriding device to match requested device
+        # Rebuild preprocessor with client-provided rename_map (cheap — no policy reload)
         device_override = {"device": self.device}
         self.preprocessor, self.postprocessor = make_pre_post_processors(
             self.policy.config,
-            pretrained_path=policy_specs.pretrained_name_or_path,
+            pretrained_path=self.config.pretrained_name_or_path,
             preprocessor_overrides={
                 "device_processor": device_override,
                 "rename_observations_processor": {"rename_map": policy_specs.rename_map},
             },
             postprocessor_overrides={"device_processor": device_override},
         )
-
-        end = time.perf_counter()
-
-        self.logger.info(f"Time taken to put policy on {self.device}: {end - start:.4f} seconds")
 
         return services_pb2.Empty()
 
@@ -353,7 +361,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         if self.commit_steps is not None and self.last_action_chunk is not None:
             kwargs["action_cond"] = self.last_action_chunk[:, self.commit_steps:, :]
 
-        chunk = self.policy.predict_action_chunk(batch, full_length=True, **kwargs)
+        with self._policy_lock:
+            chunk = self.policy.predict_action_chunk(batch, full_length=True, **kwargs)
         if chunk.ndim != 3:
             chunk = chunk.unsqueeze(0)  # adding batch dimension, now shape is (B, chunk_size, action_dim)
 
@@ -439,6 +448,45 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         )
 
         return action_chunk
+
+    # ------------------------------------------------------------------
+    # Weight hot-swap (ft_learner integration)
+    # ------------------------------------------------------------------
+
+    def _start_weights_watcher(self) -> None:
+        """Start a background thread that polls latest_weights.pt and hot-swaps policy weights."""
+        if self._weights_watcher_thread is not None and self._weights_watcher_thread.is_alive():
+            return  # already running
+        self._weights_watcher_thread = threading.Thread(
+            target=self._weights_watcher_loop, daemon=True, name="weights-watcher"
+        )
+        self._weights_watcher_thread.start()
+        self.logger.info(
+            f"[WeightsWatcher] Started — watching {self.config.weights_watch_dir}/latest_weights.pt "
+            f"every {self.config.weights_check_interval}s"
+        )
+
+    def _weights_watcher_loop(self) -> None:
+        """Poll latest_weights.pt; load and hot-swap when mtime changes."""
+        weights_path = Path(self.config.weights_watch_dir) / "latest_weights.pt"
+        last_mtime: float | None = None
+
+        while not self.shutdown_event.is_set():
+            try:
+                if weights_path.exists():
+                    mtime = weights_path.stat().st_mtime
+                    if mtime != last_mtime:
+                        last_mtime = mtime
+                        state_dict = torch.load(weights_path, map_location=self.device, weights_only=True)
+                        with self._policy_lock:
+                            self.policy.load_state_dict(state_dict, strict=False)
+                            if hasattr(self.policy, "_q_initialized"):
+                                self.policy._q_initialized = True
+                        self.logger.info(f"[WeightsWatcher] Weights hot-swapped from {weights_path}")
+            except Exception as e:
+                self.logger.warning(f"[WeightsWatcher] Failed to load weights: {e}")
+
+            self.shutdown_event.wait(timeout=self.config.weights_check_interval)
 
     def stop(self):
         """Stop the server"""

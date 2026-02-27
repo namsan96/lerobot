@@ -106,6 +106,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.groot.modeling_groot import GrootPolicy
 
         return GrootPolicy
+    elif name == "parl_diffusion":
+        from lerobot.policies.diffusion.modeling_parl_diffusion import PARLDiffusionPolicy
+
+        return PARLDiffusionPolicy
     else:
         raise NotImplementedError(f"Policy with name {name} is not implemented.")
 

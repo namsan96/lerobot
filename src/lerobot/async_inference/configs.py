@@ -50,9 +50,14 @@ class PolicyServerConfig:
     including networking settings and action chunking specifications.
     """
 
+    # Policy configuration (loaded at server startup)
+    policy_type: str = field(metadata={"help": "Policy type (e.g. 'diffusion', 'act', 'pi0')"})
+    pretrained_name_or_path: str = field(metadata={"help": "Pretrained model name or local path"})
+
     # Networking configuration
     host: str = field(default="localhost", metadata={"help": "Host address to bind the server to"})
     port: int = field(default=8080, metadata={"help": "Port number to bind the server to"})
+    device: str = field(default="cuda", metadata={"help": "Device for policy inference (e.g. 'cuda', 'cpu')"})
 
     # Timing configuration
     fps: int = field(default=DEFAULT_FPS, metadata={"help": "Frames per second"})
@@ -70,13 +75,24 @@ class PolicyServerConfig:
         metadata={"help": "Policy config overrides passed on server CLI (--policy.xxx=...); applied when loading policy."},
     )
 
+    # Fine-tuning weight hot-swap: watch this directory for latest_weights.pt written by ft_learner.
+    # Set to the same path as FTConfig.output_dir to enable online RL weight updates.
+    weights_watch_dir: str | None = field(
+        default=None,
+        metadata={"help": "Directory to watch for latest_weights.pt updates from ft_learner. If None, hot-swap is disabled."},
+    )
+    weights_check_interval: float = field(
+        default=5.0,
+        metadata={"help": "Seconds between checks for new weights in weights_watch_dir."},
+    )
+
     def __post_init__(self):
         """Validate configuration after initialization."""
         if self.port < 1 or self.port > 65535:
             raise ValueError(f"Port must be between 1 and 65535, got {self.port}")
 
-        if self.environment_dt <= 0:
-            raise ValueError(f"environment_dt must be positive, got {self.environment_dt}")
+        if self.fps <= 0:
+            raise ValueError(f"fps must be positive, got {self.fps}")
 
         if self.inference_latency < 0:
             raise ValueError(f"inference_latency must be non-negative, got {self.inference_latency}")
@@ -113,10 +129,6 @@ class RobotClientConfig:
     including network connection, policy settings, and control behavior.
     """
 
-    # Policy configuration
-    policy_type: str = field(metadata={"help": "Type of policy to use"})
-    pretrained_name_or_path: str = field(metadata={"help": "Pretrained model name or path"})
-
     # Robot configuration (for CLI usage - robot instance will be created from this)
     robot: RobotConfig = field(metadata={"help": "Robot configuration"})
 
@@ -130,9 +142,6 @@ class RobotClientConfig:
 
     # Network configuration
     server_address: str = field(default="localhost:8080", metadata={"help": "Server address to connect to"})
-
-    # Device configuration
-    policy_device: str = field(default="cpu", metadata={"help": "Device for policy inference"})
 
     # Control behavior configuration
     chunk_size_threshold: float = field(default=0.5, metadata={"help": "Threshold for chunk size control"})
@@ -167,12 +176,6 @@ class RobotClientConfig:
         default=4, metadata={"help": "Number of threads per camera for image writing."}
     )
 
-    # Populated from CLI --policy.xxx by the client entrypoint; sent to server so policy is loaded with same overrides.
-    policy_cli_overrides: list[str] = field(
-        default_factory=list,
-        metadata={"help": "Policy config overrides (e.g. from --policy.num_inference_steps=10); set from CLI when using rtc_client."},
-    )
-
     @property
     def environment_dt(self) -> float:
         """Environment time step, in seconds"""
@@ -182,15 +185,6 @@ class RobotClientConfig:
         """Validate configuration after initialization."""
         if not self.server_address:
             raise ValueError("server_address cannot be empty")
-
-        if not self.policy_type:
-            raise ValueError("policy_type cannot be empty")
-
-        if not self.pretrained_name_or_path:
-            raise ValueError("pretrained_name_or_path cannot be empty")
-
-        if not self.policy_device:
-            raise ValueError("policy_device cannot be empty")
 
         if self.chunk_size_threshold < 0 or self.chunk_size_threshold > 1:
             raise ValueError(f"chunk_size_threshold must be between 0 and 1, got {self.chunk_size_threshold}")
@@ -212,9 +206,6 @@ class RobotClientConfig:
         """Convert the configuration to a dictionary."""
         return {
             "server_address": self.server_address,
-            "policy_type": self.policy_type,
-            "pretrained_name_or_path": self.pretrained_name_or_path,
-            "policy_device": self.policy_device,
             "chunk_size_threshold": self.chunk_size_threshold,
             "fps": self.fps,
             "actions_per_chunk": self.actions_per_chunk,

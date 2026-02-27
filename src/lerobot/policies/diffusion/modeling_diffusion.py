@@ -595,7 +595,7 @@ class FlowModel(DiffusionModel):
                 B, H = sample.shape[:2]
                 # Inpaint prefix before each model call, matching JAX sample_actions.
                 if action_cond is not None:
-                    sample[:, :self.config.rtc_delay] = action_cond
+                    sample[:, :self.config.rtc_delay] = action_cond[:, :self.config.rtc_delay]
                 taus_per_step = taus.unsqueeze(1).expand(B, H).clone()  # (B, H)
                 taus_per_step[:, :self.config.rtc_delay] = 1.0
                 vel = self.unet(sample, taus_per_step, global_cond=global_cond)
@@ -610,6 +610,10 @@ class FlowModel(DiffusionModel):
                 )
 
             sample = sample + vel / self.num_inference_steps
+        
+        if self.config.rtc_type == 'train_time' and action_cond is not None:
+            sample[:, :self.config.rtc_delay] = action_cond[:, :self.config.rtc_delay]
+
         return sample
 
     def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:

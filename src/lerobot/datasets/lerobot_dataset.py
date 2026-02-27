@@ -979,20 +979,30 @@ class LeRobotDataset(torch.utils.data.Dataset):
         query_indices: dict[str, list[int]] | None = None,
     ) -> dict[str, list[float]]:
         query_timestamps = {}
-        for key in self.meta.video_keys:
-            if query_indices is not None and key in query_indices:
-                timestamps = self.hf_dataset[query_indices[key]]["timestamp"]
-                query_timestamps[key] = torch.stack(timestamps).tolist()
-            else:
-                query_timestamps[key] = [current_ts]
+        for vid_key in self.meta.video_keys:
+            # Support "next.<vid_key>" aliases: fetch timestamps from vid_key but return
+            # them under "next.<vid_key>" so _query_videos can produce the correct output key.
+            for out_key in (vid_key, f"next.{vid_key}"):
+                if query_indices is not None and out_key in query_indices:
+                    timestamps = self.hf_dataset[query_indices[out_key]]["timestamp"]
+                    query_timestamps[out_key] = torch.stack(timestamps).tolist()
+            if vid_key not in query_timestamps and f"next.{vid_key}" not in query_timestamps:
+                query_timestamps[vid_key] = [current_ts]
 
         return query_timestamps
 
     def _query_hf_dataset(self, query_indices: dict[str, list[int]]) -> dict:
+        def _src(key: str) -> str:
+            # Allow "next.<feature>" as an alias for "<feature>" fetched at a future delta.
+            # The output dict key stays "next.<feature>"; only the hf_dataset lookup is remapped.
+            if key.startswith("next.") and key not in self.hf_dataset.features:
+                return key[len("next."):]
+            return key
+
         return {
-            key: torch.stack(self.hf_dataset[q_idx][key])
+            key: torch.stack(self.hf_dataset[q_idx][_src(key)])
             for key, q_idx in query_indices.items()
-            if key not in self.meta.video_keys
+            if _src(key) not in self.meta.video_keys
         }
 
     def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict[str, torch.Tensor]:
@@ -1007,10 +1017,12 @@ class LeRobotDataset(torch.utils.data.Dataset):
             # Episodes are stored sequentially on a single mp4 to reduce the number of files.
             # Thus we load the start timestamp of the episode on this mp4 and,
             # shift the query timestamp accordingly.
-            from_timestamp = ep[f"videos/{vid_key}/from_timestamp"]
+            # Support "next.<vid_key>" aliases: resolve to the underlying video file.
+            src_vid_key = vid_key[len("next."):] if vid_key.startswith("next.") and vid_key not in self.meta.video_keys else vid_key
+            from_timestamp = ep[f"videos/{src_vid_key}/from_timestamp"]
             shifted_query_ts = [from_timestamp + ts for ts in query_ts]
 
-            video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
+            video_path = self.root / self.meta.get_video_file_path(ep_idx, src_vid_key)
             if self._video_cache is not None:
                 cache_key = video_path.as_posix()
                 if cache_key in self._video_cache:
