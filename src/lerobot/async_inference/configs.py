@@ -175,6 +175,9 @@ class RobotClientConfig:
     dataset_num_image_writer_threads_per_camera: int = field(
         default=4, metadata={"help": "Number of threads per camera for image writing."}
     )
+    dataset_resume: bool = field(
+        default=False, metadata={"help": "If True, resume recording into an existing dataset instead of creating a new one."}
+    )
 
     @property
     def environment_dt(self) -> float:

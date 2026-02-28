@@ -103,8 +103,8 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
                 revision=revision,
                 **kwargs,
             )
-            if 'cli_overrides' in kwargs:
-                kwargs.pop('cli_overrides')
+        kwargs.pop('cli_overrides', None)
+        kwargs.pop('config_cls', None)
         model_id = str(pretrained_name_or_path)
         instance = cls(config, **kwargs)
         if os.path.isdir(model_id):

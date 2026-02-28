@@ -35,6 +35,7 @@ from torch.distributions import Categorical
 
 from diffusers.models.attention import BasicTransformerBlock
 
+from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
@@ -46,15 +47,16 @@ log = logging.getLogger(__name__)
 # PARL-specific configuration
 # ---------------------------------------------------------------------------
 
+@PreTrainedConfig.register_subclass("parl_diffusion")
 @dataclass
-class PARLDiffusionConfig:
+class PARLDiffusionConfig(DiffusionConfig):
     # Sampling
     n_samples: int = 16
     distil_temp: float = 0.0        # 0 = argmax; >0 = softmax temperature selection
     noise_injection_std: float = 0.0  # additive noise per denoising step (flow matching)
 
     # IQL critic
-    expectile: float = 0.7          # asymmetric weight for V expectile regression
+    expectile: float = 0.5          # asymmetric weight for V expectile regression
     gamma: float = 0.99             # discount factor for TD backup
     tau: float = 0.005              # EMA rate for target Q network
 
@@ -209,14 +211,14 @@ class PARLDiffusionPolicy(DiffusionPolicy):
     Override
     --------
     predict_action_chunk(...)       uses Q-based action selection
-    from_pretrained(...)            loads in inference_only mode by default (Q only, no V/target_q)
+    from_pretrained(...)            ensures config is loaded as PARLDiffusionConfig
     """
 
     name = "parl_diffusion"
+    config_class = PARLDiffusionConfig
 
-    def __init__(self, config: DiffusionConfig, parl_cfg: PARLDiffusionConfig | None = None) -> None:
+    def __init__(self, config: PARLDiffusionConfig) -> None:
         super().__init__(config)
-        self.parl_cfg = parl_cfg or PARLDiffusionConfig()
 
         if not config.use_dit:
             raise NotImplementedError(
@@ -239,7 +241,7 @@ class PARLDiffusionPolicy(DiffusionPolicy):
         encoder_token_dim = self.diffusion.rgb_encoder.feature_dim  # DINOv3 embed_dim
         cls_dim = encoder_token_dim  # CLS token has same dim as patch tokens
 
-        pcfg = self.parl_cfg
+        pcfg = self.config
         self.critic_q = TransformerQNetwork(
             encoder_token_dim=encoder_token_dim,
             state_dim=state_dim,
@@ -259,28 +261,47 @@ class PARLDiffusionPolicy(DiffusionPolicy):
             v_in_dim = state_dim + cls_dim * self._n_obs_steps * self._n_cams
             self.critic_v = VNetwork(v_in_dim, pcfg.v_hidden_dims)
 
+        # Frozen pretrained UNet for high-noise steps (t >= num_ft_train_steps).
+        # Snapshotted from the base checkpoint before any fine-tuning begins.
+        # Included in state_dict() so it is pushed to and loaded by rtc_server, making
+        # inference self-contained — no caller needs to know about PARLBCAlgorithm.
+        self.pretrained_unet = copy.deepcopy(self.diffusion.unet)
+        self.pretrained_unet.requires_grad_(False)
+        self.pretrained_unet.eval()
+
+        # Cutoff in DDPM step convention: steps t < num_ft_train_steps use diffusion.unet
+        # (fine-tuned); steps t >= num_ft_train_steps use pretrained_unet. 0 = all steps
+        # fine-tuned (no split). Stored as a buffer so it travels with state_dict().
+        self.register_buffer("_num_ft_train_steps", torch.tensor(0, dtype=torch.long))
+
         # Set to True after first weight hot-swap from ft_learner.
         # Until then, predict_action_chunk falls back to plain diffusion sampling.
         self._q_initialized: bool = False
 
+    @property
+    def num_ft_train_steps(self) -> int:
+        return int(self._num_ft_train_steps.item())
+
+    @num_ft_train_steps.setter
+    def num_ft_train_steps(self, value: int) -> None:
+        self._num_ft_train_steps.fill_(value)
+
     def train(self, mode: bool = True) -> "PARLDiffusionPolicy":
-        """Keep critic_target_q permanently in eval mode regardless of parent train() calls."""
+        """Keep critic_target_q and pretrained_unet permanently in eval mode."""
         super().train(mode)
         if hasattr(self, "critic_target_q"):
             self.critic_target_q.eval()
+        self.pretrained_unet.eval()
         return self
 
     @classmethod
     def from_pretrained(cls, pretrained_name_or_path, **kwargs):
-        """Load in inference_only mode by default: Q network only, no V or target Q.
-
-        The training path (PARLBCAlgorithm) never calls from_pretrained for PARLDiffusionPolicy —
-        it upgrades a loaded DiffusionPolicy directly. So from_pretrained is only called by the
-        inference server, which only needs critic_q for Q-guided action selection.
-
-        Override by passing parl_cfg=PARLDiffusionConfig(inference_only=False) explicitly.
+        """Ensure config is loaded as PARLDiffusionConfig even when the checkpoint was saved
+        as a plain DiffusionPolicy (type: diffusion). PARL-specific fields (inference_only,
+        n_samples, etc.) use their dataclass defaults unless overridden via --policy.XX.
+        strict=False (the default) handles the missing critic keys from a base checkpoint.
         """
-        kwargs.setdefault("parl_cfg", PARLDiffusionConfig(inference_only=True))
+        kwargs.setdefault("config_cls", PARLDiffusionConfig)
         return super().from_pretrained(pretrained_name_or_path, **kwargs)
 
     # ------------------------------------------------------------------
@@ -356,11 +377,11 @@ class PARLDiffusionPolicy(DiffusionPolicy):
         Falls back to plain diffusion sampling until Q weights have been loaded
         from ft_learner (i.e. until _q_initialized is set True by the weights watcher).
         """
-        if not self._q_initialized:
-            return super().predict_action_chunk(batch, noise=noise, full_length=full_length, action_cond=action_cond)
         batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
+        if not self._q_initialized:
+            return self.diffusion.generate_actions(batch, noise=noise, full_length=full_length, action_cond=action_cond, noise_injection_std=self.config.noise_injection_std)
         batch = _stack_images(batch, self)
-        return self._sample_and_select(batch, self.parl_cfg.n_samples, full_length, action_cond=action_cond)
+        return self._sample_and_select(batch, self.config.n_samples, full_length, action_cond=action_cond)
 
     @torch.no_grad()
     def _sample_and_select(self, batch: dict, n_samples: int, full_length: bool = False, action_cond=None) -> Tensor:
@@ -381,9 +402,12 @@ class PARLDiffusionPolicy(DiffusionPolicy):
             action_cond.repeat(n_samples, *((1,) * (action_cond.dim() - 1)))
             if action_cond is not None else None
         )
+        pt_unet = self.pretrained_unet if self.num_ft_train_steps > 0 else None
         sampled = dm.conditional_sample(
             n_samples * B, global_cond=global_cond_n, action_cond=action_cond_n,
-            noise_injection_std=self.parl_cfg.noise_injection_std,
+            noise_injection_std=self.config.noise_injection_std,
+            pretrained_unet=pt_unet,
+            num_ft_train_steps=self.num_ft_train_steps,
         ).view(n_samples, B, self._horizon, self._action_dim)
 
         q_scores = self._q_score_samples(encoder_tokens, state_flat, sampled)
@@ -417,8 +441,8 @@ class PARLDiffusionPolicy(DiffusionPolicy):
         returns  : (B, horizon, Da)
         """
         n, B = sampled.shape[:2]
-        if self.parl_cfg.distil_temp > 0:
-            probs = F.softmax(q_scores / self.parl_cfg.distil_temp, dim=0).T  # (B, n)
+        if self.config.distil_temp > 0:
+            probs = F.softmax(q_scores / self.config.distil_temp, dim=0).T  # (B, n)
             best_idx = Categorical(probs=probs).sample()                       # (B,)
         else:
             best_idx = q_scores.argmax(dim=0)                                  # (B,)
@@ -445,7 +469,7 @@ class PARLDiffusionPolicy(DiffusionPolicy):
 
         Returns (q_loss, v_loss, stats_dict).
         """
-        pcfg = self.parl_cfg
+        pcfg = self.config
         obs = _stack_images(batch, self)
 
         with torch.no_grad():
@@ -507,7 +531,7 @@ class PARLDiffusionPolicy(DiffusionPolicy):
         with a delta of n_action_steps / fps.  Terminal frames must be excluded via
         drop_n_last_frames = n_action_steps in FTConfig.
         """
-        pcfg = self.parl_cfg
+        pcfg = self.config
         next_obs: dict[str, Tensor] = {OBS_STATE: batch[pcfg.next_obs_state_key]}
 
         next_img_keys = [k for k in batch if k.startswith(pcfg.next_obs_image_prefix + ".")]
@@ -535,7 +559,7 @@ class PARLDiffusionPolicy(DiffusionPolicy):
         Gradients flow through unet AND rgb_encoder (encoder is trained by the actor).
         ft_diffusion is the frozen reference network; only self.diffusion is updated.
         """
-        pcfg = self.parl_cfg
+        pcfg = self.config
         n = pcfg.n_samples
         obs = _stack_images(batch, self)
         B = batch[ACTION].shape[0]
@@ -558,12 +582,17 @@ class PARLDiffusionPolicy(DiffusionPolicy):
 
         # BC loss — grad flows through self.diffusion.compute_loss
         #    → _prepare_global_conditioning → rgb_encoder
+        # Restrict to t < num_ft_train_steps so self.unet is only trained on the steps
+        # it will actually handle at inference (pretrained_unet covers the rest).
         bc_batch = dict(obs)
         bc_batch[ACTION] = best_action
         bc_batch["action_is_pad"] = torch.zeros(
             B, self._horizon, dtype=torch.bool, device=device
         )
-        actor_loss = self.diffusion.compute_loss(bc_batch)
+        actor_loss = self.diffusion.compute_loss(
+            bc_batch,
+            max_timestep=num_ft_train_steps if num_ft_train_steps > 0 else None,
+        )
 
         stats = {
             "actor_loss": actor_loss.item(),
@@ -582,6 +611,6 @@ class PARLDiffusionPolicy(DiffusionPolicy):
         """EMA update: target_q ← τ * q + (1 - τ) * target_q."""
         if not hasattr(self, "critic_target_q"):
             raise RuntimeError("update_target_q called on inference_only PARLDiffusionPolicy")
-        tau = self.parl_cfg.tau
+        tau = self.config.tau
         for p, tp in zip(self.critic_q.parameters(), self.critic_target_q.parameters()):
             tp.data.copy_(tau * p.data + (1.0 - tau) * tp.data)

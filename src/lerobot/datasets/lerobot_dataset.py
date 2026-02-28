@@ -102,6 +102,12 @@ class LeRobotDatasetMetadata:
                 raise FileNotFoundError
             self.load_metadata()
         except (FileNotFoundError, NotADirectoryError):
+            if (self.root / "meta").exists():
+                raise FileNotFoundError(
+                    f"Dataset metadata not found at '{self.root}/meta/info.json'. "
+                    f"The local dataset directory exists but metadata is missing or incomplete. "
+                    f"If data collection is still in progress, wait until at least one episode is finalized."
+                )
             if is_valid_version(self.revision):
                 self.revision = get_safe_version(self.repo_id, self.revision)
 
@@ -408,6 +414,19 @@ class LeRobotDatasetMetadata:
         episode_dict.update(episode_metadata)
         episode_dict.update(flatten_dict({"stats": episode_stats}))
         self._save_episode_metadata(episode_dict)
+        # Close writer so the parquet file has a valid footer and is immediately readable.
+        # Advance file index so the next episode opens a fresh file instead of overwriting.
+        self._flush_metadata_buffer()
+        if self.writer is not None:
+            self.writer.close()
+            self.writer = None
+            if self.latest_episode is not None:
+                chunk_idx = self.latest_episode["meta/episodes/chunk_index"][0]
+                file_idx = self.latest_episode["meta/episodes/file_index"][0]
+                chunk_idx, file_idx = update_chunk_file_indices(chunk_idx, file_idx, self.chunks_size)
+                self.latest_episode = dict(self.latest_episode)
+                self.latest_episode["meta/episodes/chunk_index"] = [chunk_idx]
+                self.latest_episode["meta/episodes/file_index"] = [file_idx]
 
         # Update info
         self.info["total_episodes"] += 1

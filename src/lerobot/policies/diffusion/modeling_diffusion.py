@@ -425,7 +425,7 @@ class DiffusionModel(nn.Module):
             global_cond = torch.cat([global_cond, adv_embed], dim=-1)
         return global_cond
 
-    def generate_actions(self, batch: dict[str, Tensor], noise: Tensor | None = None, full_length: bool = False, action_cond=None) -> Tensor:
+    def generate_actions(self, batch: dict[str, Tensor], noise: Tensor | None = None, full_length: bool = False, action_cond=None, noise_injection_std: float = 0.0) -> Tensor:
         """
         This function expects `batch` to have:
         {
@@ -443,7 +443,7 @@ class DiffusionModel(nn.Module):
         global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
 
         # run sampling
-        actions = self.conditional_sample(batch_size, global_cond=global_cond, noise=noise, action_cond=action_cond)
+        actions = self.conditional_sample(batch_size, global_cond=global_cond, noise=noise, action_cond=action_cond, noise_injection_std=noise_injection_std)
 
         # Extract `n_action_steps` steps worth of actions (from the current observation).
         start = n_obs_steps - 1
@@ -455,7 +455,7 @@ class DiffusionModel(nn.Module):
 
         return actions
 
-    def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
+    def compute_loss(self, batch: dict[str, Tensor], max_timestep: int | None = None) -> Tensor:
         """
         This function expects `batch` to have (at least):
         {
@@ -468,6 +468,10 @@ class DiffusionModel(nn.Module):
             "action": (B, horizon, action_dim)
             "action_is_pad": (B, horizon)
         }
+
+        max_timestep: if set, restrict training to DDPM timesteps [0, max_timestep).
+            Used by PARL-BC to avoid training the fine-tuned UNet on timesteps handled
+            by the frozen pretrained UNet at inference (t >= max_timestep).
         """
         # Input validation.
         assert set(batch).issuperset({OBS_STATE, ACTION, "action_is_pad"})
@@ -485,9 +489,10 @@ class DiffusionModel(nn.Module):
         # Sample noise to add to the trajectory.
         eps = torch.randn(trajectory.shape, device=trajectory.device)
         # Sample a random noising timestep for each item in the batch.
+        high = max_timestep if max_timestep is not None else self.noise_scheduler.config.num_train_timesteps
         timesteps = torch.randint(
             low=0,
-            high=self.noise_scheduler.config.num_train_timesteps,
+            high=high,
             size=(trajectory.shape[0],),
             device=trajectory.device,
         ).long()
@@ -544,8 +549,19 @@ class FlowModel(DiffusionModel):
         generator: torch.Generator | None = None,
         noise: Tensor | None = None,
         action_cond=None,
+        pretrained_unet=None,
+        num_ft_train_steps: int = 0,
         noise_injection_std: float = 0.0,
     ) -> Tensor:
+        """
+        pretrained_unet: frozen pre-trained UNet used for early (high-noise) flow steps.
+                         None = use self.unet throughout.
+        num_ft_train_steps: number of fine-tuned steps in DDPM convention. The last
+                            num_ft_train_steps denoising steps (i >= num_inference_steps -
+                            num_ft_train_steps, i.e. tau in [1 - num_ft_train_steps /
+                            num_inference_steps, 1)) use self.unet; earlier steps use
+                            pretrained_unet.
+        """
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
 
@@ -568,6 +584,15 @@ class FlowModel(DiffusionModel):
             tau = i / self.num_inference_steps
             taus = torch.full(sample.shape[:1], tau, dtype=dtype, device=sample.device)
 
+            # Use frozen pretrained UNet for early (high-noise) steps, fine-tuned UNet for later steps.
+            # Fine-tuned steps are the last num_ft_train_steps steps (DDPM convention), i.e. those
+            # where i >= num_inference_steps - num_ft_train_steps.
+            unet = (
+                pretrained_unet
+                if pretrained_unet is not None and i < (self.num_inference_steps - num_ft_train_steps)
+                else self.unet
+            )
+
             if action_cond is not None and self.config.rtc_type == 'inference_time_soft':
                 assert batch_size == action_cond.shape[0] == 1, "Batch is not suported"
                 # Preparations.
@@ -588,14 +613,14 @@ class FlowModel(DiffusionModel):
                 indices = torch.arange(self.config.horizon, device=sample.device)
                 linear_c = (b - indices) / (b - a + 1)
                 exp_c = linear_c * (torch.exp(linear_c) - 1) / (np.e - 1)
-                
+
                 single_inpaint_mask = exp_c
                 single_inpaint_mask[:a] = 1
                 single_inpaint_mask[b:] = 0
 
                 # (Y-A1)^T diag(W)  X   dA_1 / dA_tau
                 def single_a_1_fn(single_a_tau):
-                    single_vel = self.unet(single_a_tau.unsqueeze(0), taus, global_cond=global_cond).squeeze(0)
+                    single_vel = unet(single_a_tau.unsqueeze(0), taus, global_cond=global_cond).squeeze(0)
                     single_a_1 = single_a_tau + (1 - tau) * single_vel
                     return single_a_1, single_vel
                 single_a_tau = sample.squeeze(0)
@@ -609,19 +634,18 @@ class FlowModel(DiffusionModel):
                 coeff = min(5, coeff)
                 vel = (single_vel + coeff * single_guidance).unsqueeze(0)
 
-            elif self.config.rtc_type == "train_time":
+            elif action_cond is not None and self.config.rtc_type == "train_time":
                 B, H = sample.shape[:2]
                 # Inpaint prefix before each model call, matching JAX sample_actions.
-                if action_cond is not None:
-                    sample[:, :self.config.rtc_delay] = action_cond[:, :self.config.rtc_delay]
+                sample[:, :self.config.rtc_delay] = action_cond[:, :self.config.rtc_delay]
                 taus_per_step = taus.unsqueeze(1).expand(B, H).clone()  # (B, H)
                 taus_per_step[:, :self.config.rtc_delay] = 1.0
-                vel = self.unet(sample, taus_per_step, global_cond=global_cond)
+                vel = unet(sample, taus_per_step, global_cond=global_cond)
 
             elif self.config.rtc_type == "legato":
                 pass
             else:
-                vel = self.unet(
+                vel = unet(
                     sample,
                     taus,
                     global_cond=global_cond,
@@ -636,7 +660,7 @@ class FlowModel(DiffusionModel):
 
         return sample
 
-    def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
+    def compute_loss(self, batch: dict[str, Tensor], max_timestep: int | None = None) -> Tensor:
         # Input validation.
         assert set(batch).issuperset({OBS_STATE, ACTION, "action_is_pad"})
         assert OBS_IMAGES in batch or OBS_ENV_STATE in batch
@@ -656,11 +680,22 @@ class FlowModel(DiffusionModel):
         H = trajectory.shape[1]
         device = trajectory.device
 
+        # max_timestep is in DDPM step convention [0, K).
+        # For flow matching, fine-tuned steps are the last max_timestep denoising steps,
+        # corresponding to tau in [1 - max_timestep/num_inference_steps, 1).
+        tau_min = (
+            1.0 - max_timestep / self.num_inference_steps
+            if max_timestep is not None else 0.0
+        )
+
         if self.config.t_schedule is None:
-            timesteps = torch.rand(B, device=device)[:, None].expand(B, H).clone()  # (B, H)
+            timesteps = tau_min + torch.rand(B, device=device) * (1.0 - tau_min)
+            timesteps = timesteps[:, None].expand(B, H).clone()  # (B, H)
         elif self.config.t_schedule == 'beta0.999':
             z = torch.distributions.Beta(1.5, 1).sample((B,)).to(device)
-            t = 0.999 * (1 - z)
+            t = 0.999 * (1 - z)  # t in [0, 0.999]
+            # Rescale [0, 0.999] -> [tau_min, 1) to restrict to fine-tuned tau range.
+            t = tau_min + t * (1.0 - tau_min) / 0.999
             timesteps = t[:, None].expand(B, H).clone()  # (B, H)
 
         noisy_trajectory = (1 - timesteps.unsqueeze(-1)) * eps + timesteps.unsqueeze(-1) * trajectory

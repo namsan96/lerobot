@@ -210,5 +210,6 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
             config_file = f.name
 
         cli_overrides = policy_kwargs.pop("cli_overrides", [])
+        config_cls = policy_kwargs.pop("config_cls", None) or orig_config.__class__
         with draccus.config_type("json"):
-            return draccus.parse(orig_config.__class__, config_file, args=cli_overrides)
+            return draccus.parse(config_cls, config_file, args=cli_overrides)

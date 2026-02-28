@@ -64,7 +64,7 @@ from lerobot.transport import (
 )
 from lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
 from lerobot.utils.constants import ACTION, OBS_STR
-from lerobot.utils.control_utils import init_keyboard_listener
+from lerobot.utils.control_utils import init_keyboard_listener, sanity_check_dataset_robot_compatibility
 
 
 from .configs import RobotClientConfig
@@ -135,17 +135,28 @@ class RobotClient:
         self.dataset: LeRobotDataset | None = None
         if config.dataset_repo_id is not None:
             num_cameras = len(self.robot.cameras) if hasattr(self.robot, "cameras") else 0
-            dataset_features = self._make_dataset_features(config.dataset_video)
-            self.dataset = LeRobotDataset.create(
-                config.dataset_repo_id,
-                config.fps,
-                # root=config.dataset_root,
-                robot_type=self.robot.name,
-                features=dataset_features,
-                use_videos=config.dataset_video,
-                image_writer_processes=config.dataset_num_image_writer_processes,
-                image_writer_threads=config.dataset_num_image_writer_threads_per_camera * num_cameras,
-            )
+            if config.dataset_resume:
+                self.dataset = LeRobotDataset(
+                    config.dataset_repo_id,
+                    root=config.dataset_root,
+                )
+                if config.dataset_num_image_writer_processes or config.dataset_num_image_writer_threads_per_camera:
+                    self.dataset.start_image_writer(
+                        num_processes=config.dataset_num_image_writer_processes,
+                        num_threads=config.dataset_num_image_writer_threads_per_camera * num_cameras,
+                    )
+            else:
+                dataset_features = self._make_dataset_features(config.dataset_video)
+                self.dataset = LeRobotDataset.create(
+                    config.dataset_repo_id,
+                    config.fps,
+                    root=config.dataset_root,
+                    robot_type=self.robot.name,
+                    features=dataset_features,
+                    use_videos=config.dataset_video,
+                    image_writer_processes=config.dataset_num_image_writer_processes,
+                    image_writer_threads=config.dataset_num_image_writer_threads_per_camera * num_cameras,
+                )
 
         # FPS measurement
         self.fps_tracker = FPSTracker(target_fps=self.config.fps)
@@ -171,12 +182,33 @@ class RobotClient:
         }
         return combine_feature_dicts(obs_features, action_features, reward_feature, terminated_feature, debug_features)
 
+    def _restart_keyboard_listener(self):
+        self.listener, self.events = init_keyboard_listener()
+
+    def _wait_for_enter(self, prompt: str = ""):
+        import sys, termios
+        if self.listener is not None:
+            self.listener.stop()
+        try:
+            termios.tcflush(sys.stdin, termios.TCIFLUSH)
+            input(prompt)
+        finally:
+            self._restart_keyboard_listener()
+
     def _prompt_terminated(self) -> float:
-        while True:
-            val = input("Terminated? (0=False, 1=True): ").strip()
-            if val in ("0", "1"):
-                return float(val)
-            print("Please enter 0 or 1.")
+        import sys, termios
+        if self.listener is not None:
+            self.listener.stop()
+        try:
+            termios.tcflush(sys.stdin, termios.TCIFLUSH)
+            while True:
+                val = input("Terminated? (0=False, 1=True): ").strip()
+                if val in ("0", "1"):
+                    return float(val)
+                print("Please enter 0 or 1.")
+        finally:
+            self._restart_keyboard_listener()
+
 
     @property
     def running(self):
@@ -414,7 +446,7 @@ class RobotClient:
         chunk_idx = 0
 
         self.robot.go_to_home()
-        input("Press Enter to start first episode...")
+        self._wait_for_enter("Press Enter to start first episode...")
 
         # Outer episode loop
         while self.running:
@@ -505,10 +537,14 @@ class RobotClient:
                     terminated = self._prompt_terminated()
                     self.dataset.episode_buffer["terminated"][-1] = np.array([terminated], dtype=np.float32)
                     self.dataset.save_episode()
+                    # Close data parquet writer so ft_learner (separate process) can read the file.
+                    # _writer_closed_for_reading tells _save_episode_data to open a new file next episode.
+                    self.dataset._close_writer()
+                    self.dataset._writer_closed_for_reading = True
                     self.logger.info(f"Episode {self.dataset.num_episodes} saved with terminated={bool(terminated)}")
-                    input("Enter to start next episode")
+                    self._wait_for_enter("Enter to start next episode")
             else:
-                input("Enter to restart")
+                self._wait_for_enter("Enter to restart")
 
             # Reset flags and chunk state for the next episode
             self.events["exit_early"] = False

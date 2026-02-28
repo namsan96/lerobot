@@ -10,17 +10,21 @@ PARLDiffusionPolicy, so this file only owns the optimizers and update schedule.
 
 import copy
 import logging
+import random
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
 
-from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
 from lerobot.policies.diffusion.modeling_parl_diffusion import (
-    PARLDiffusionConfig,
     PARLDiffusionPolicy,
+    _expand_obs,
+    _stack_images,
 )
-from lerobot.rl.algorithm import Algorithm
+from lerobot.configs.types import NormalizationMode
+from lerobot.rl.algorithm import Algorithm, AlgorithmConfig
+from lerobot.utils.constants import ACTION
 
 log = logging.getLogger(__name__)
 
@@ -29,11 +33,9 @@ log = logging.getLogger(__name__)
 # Config
 # ---------------------------------------------------------------------------
 
+@AlgorithmConfig.register_subclass("parl_bc")
 @dataclass
-class PARLBCConfig:
-    # PARL policy config (sampling, IQL hyperparams, network sizes)
-    parl: PARLDiffusionConfig = None  # filled in __post_init__
-
+class PARLBCConfig(AlgorithmConfig):
     # Optimizers
     actor_lr: float = 1e-4
     critic_lr: float = 1e-4
@@ -59,9 +61,13 @@ class PARLBCConfig:
     # Freeze image encoder during actor updates
     freeze_image_encoder: bool = False
 
-    def __post_init__(self):
-        if self.parl is None:
-            self.parl = PARLDiffusionConfig()
+    # Debug info: save Q/V trajectories and sampled action chunks every N outer iterations.
+    # 0 = disabled.
+    debug_info_freq: int = 0
+    debug_info_dir: str = "debug_info"
+
+    def make_algorithm(self, policy: "PARLDiffusionPolicy") -> "PARLBCAlgorithm":
+        return PARLBCAlgorithm(policy, cfg=self)
 
 
 # ---------------------------------------------------------------------------
@@ -82,21 +88,20 @@ class PARLBCAlgorithm(Algorithm):
 
         cfg = FTConfig(
             pretrained_name_or_path="path/to/model",
-            policy_type="diffusion",
+            policy_type="parl_diffusion",
             dataset_root="path/to/dataset",
         )
         train(cfg, algorithm_cls=partial(PARLBCAlgorithm, cfg=PARLBCConfig()))
     """
 
-    def __init__(self, policy: DiffusionPolicy, cfg: PARLBCConfig = None) -> None:
+    def __init__(self, policy: PARLDiffusionPolicy, cfg: PARLBCConfig = None) -> None:
         self.cfg = cfg or PARLBCConfig()
 
-        # Upgrade base DiffusionPolicy to PARLDiffusionPolicy if needed.
-        # strict=False: diffusion weights are loaded; Q/V params are randomly initialized.
         if not isinstance(policy, PARLDiffusionPolicy):
-            parl_policy = PARLDiffusionPolicy(policy.config, self.cfg.parl)
-            parl_policy.load_state_dict(policy.state_dict(), strict=False)
-            policy = parl_policy
+            raise TypeError(
+                f"PARLBCAlgorithm requires a PARLDiffusionPolicy, got {type(policy).__name__}. "
+                "Set policy_type='parl_diffusion' in FTConfig."
+            )
 
         super().__init__(policy)
 
@@ -117,12 +122,11 @@ class PARLBCAlgorithm(Algorithm):
         for p in self.ft_diffusion.parameters():
             p.requires_grad_(False)
 
-        # pretrained_unet: forever-frozen original UNet used for t >= num_ft_train_steps.
-        # Captures the initial pretrained weights before any fine-tuning begins.
-        self.pretrained_unet = copy.deepcopy(policy.diffusion.unet)
-        self.pretrained_unet.eval()
-        for p in self.pretrained_unet.parameters():
-            p.requires_grad_(False)
+        # pretrained_unet lives in the policy (policy.pretrained_unet), snapshotted at
+        # __init__ time before any fine-tuning. Setting num_ft_train_steps on the policy
+        # writes to the _num_ft_train_steps buffer so it is pushed to rtc_server with
+        # the rest of the state dict.
+        policy.num_ft_train_steps = self.cfg.num_ft_train_steps
 
         # Optionally freeze image encoder (exclude from actor updates)
         if self.cfg.freeze_image_encoder and hasattr(policy.diffusion, "rgb_encoder"):
@@ -139,6 +143,8 @@ class PARLBCAlgorithm(Algorithm):
         # Data iterator — persists across update() calls; reset when loader changes
         self._current_loader: DataLoader | None = None
         self._data_iter = None
+
+        self._debug_info_dir = Path(cfg.debug_info_dir)
 
     @property
     def policy(self) -> PARLDiffusionPolicy:
@@ -158,8 +164,12 @@ class PARLBCAlgorithm(Algorithm):
         except StopIteration:
             self._data_iter = iter(loader)
             batch = next(self._data_iter)
-        device = next(self.policy.parameters()).device
-        return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+        if self.preprocessor is not None:
+            batch = self.preprocessor(batch)
+        else:
+            device = next(self.policy.parameters()).device
+            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+        return batch
 
     # ------------------------------------------------------------------
     # Sync helpers
@@ -185,6 +195,7 @@ class PARLBCAlgorithm(Algorithm):
 
         # 2. Critic phase
         for step in range(self.cfg.n_batch_per_itr):
+            print(f'Critic step {step}')
             batch = self._next_batch(loader)
             info = self._critic_update(batch)
             itr_info.update(info)
@@ -204,6 +215,10 @@ class PARLBCAlgorithm(Algorithm):
 
         # 4. Push updated actor back to ft_diffusion
         self._sync_ft_from_distilling()
+
+        # 5. Periodic debug info dump
+        if self.cfg.debug_info_freq > 0 and itr % self.cfg.debug_info_freq == 0:
+            self.debug_info(loader.dataset, itr)
 
         return itr_info
 
@@ -232,7 +247,7 @@ class PARLBCAlgorithm(Algorithm):
     def _actor_update(self, batch: dict) -> dict:
         actor_loss, stats = self.policy.actor_loss(
             batch, self.ft_diffusion,
-            pretrained_unet=self.pretrained_unet,
+            pretrained_unet=self.policy.pretrained_unet,
             num_ft_train_steps=self.cfg.num_ft_train_steps,
         )
 
@@ -243,3 +258,130 @@ class PARLBCAlgorithm(Algorithm):
         self.actor_optimizer.step()
 
         return stats
+
+    # ------------------------------------------------------------------
+    # Debug info
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def debug_info(self, dataset, itr: int) -> None:
+        """Compute and save debug diagnostics for the current policy.
+
+        Samples up to 5 random episodes, then for each episode:
+          - Computes Q(s_t, a_t) and V(s_t) at every timestep t using the
+            dataset action (behaviour-policy evaluation).
+          - At every horizon-th timestep, draws 20 action chunks from the
+            current diffusion policy and records their Q scores.
+          - Attaches the raw per-step rewards and terminated flags for the
+            full episode.
+
+        Everything is saved as a single .pt file:
+            {debug_info_dir}/debug_info_{itr:06d}.pt
+        """
+        policy = self.policy
+        was_training = policy.training
+        policy.eval()
+        device = next(policy.parameters()).device
+
+        n_ep = dataset.meta.total_episodes
+        ep_indices = random.sample(range(n_ep), min(5, n_ep))
+
+        # Ensure the underlying HF dataset is loaded (no-op if already loaded).
+        dataset._ensure_hf_dataset_loaded()
+
+        episodes_out = []
+        for ep_idx in ep_indices:
+            ep_meta = dataset.meta.episodes[ep_idx]
+            from_idx = ep_meta["dataset_from_index"]
+            to_idx = ep_meta["dataset_to_index"]
+            ep_len = to_idx - from_idx
+
+            # Raw per-step rewards and terminated flags for the whole episode.
+            raw_frames = dataset.hf_dataset[list(range(from_idx, to_idx))]
+            rewards_ep = torch.stack(raw_frames["reward"]).float()       # (ep_len,)
+            terminated_ep = torch.stack(raw_frames["terminated"]).float()  # (ep_len,)
+
+            # ------------------------------------------------------------------
+            # Q and V at every timestep (using dataset actions)
+            # ------------------------------------------------------------------
+            q_vals, v_vals, actions_ep = [], [], []
+            for t in range(ep_len):
+                item = dataset[from_idx + t]
+                batch = {
+                    k: v.unsqueeze(0)
+                    for k, v in item.items() if isinstance(v, torch.Tensor)
+                }
+                if self.preprocessor is not None:
+                    batch = self.preprocessor(batch)
+                else:
+                    batch = {k: v.to(device) for k, v in batch.items()}
+                batch = _stack_images(batch, policy)
+
+                encoder_tokens, state_flat, cls_tokens_flat = policy.encode_obs(batch)
+                v_feat = torch.cat([state_flat, cls_tokens_flat], dim=-1)
+                action = batch[ACTION][:, :policy._n_act]  # (1, n_act, Da)
+
+                q_vals.append(policy.critic_q(encoder_tokens, state_flat, action).squeeze(0).cpu())
+                v_vals.append(policy.critic_v(v_feat).squeeze(0).cpu())
+                actions_ep.append(item[ACTION][0].cpu())  # (Da,) unnormalized (raw from dataset)
+
+            # ------------------------------------------------------------------
+            # Sample 20 action chunks at obs[::horizon]
+            # ------------------------------------------------------------------
+            sampled_at_keyframes = []
+            for t in range(0, ep_len, policy._horizon):
+                item = dataset[from_idx + t]
+                batch = {
+                    k: v.unsqueeze(0)
+                    for k, v in item.items() if isinstance(v, torch.Tensor)
+                }
+                if self.preprocessor is not None:
+                    batch = self.preprocessor(batch)
+                else:
+                    batch = {k: v.to(device) for k, v in batch.items()}
+                batch = _stack_images(batch, policy)
+
+                dm = policy.diffusion
+                n_samp = 20
+                obs_n = _expand_obs(batch, n_samp)
+                global_cond_n = dm._prepare_global_conditioning(obs_n)
+                pt_unet = policy.pretrained_unet if policy.num_ft_train_steps > 0 else None
+                sampled = dm.conditional_sample(
+                    n_samp,
+                    global_cond=global_cond_n,
+                    pretrained_unet=pt_unet,
+                    num_ft_train_steps=policy.num_ft_train_steps,
+                    noise_injection_std=policy.config.noise_injection_std,
+                ).view(
+                    n_samp, 1, policy._horizon, policy._action_dim
+                )  # (20, 1, H, Da)
+
+                encoder_tokens, state_flat, _ = policy.encode_obs(batch)
+                q_scores = policy._q_score_samples(encoder_tokens, state_flat, sampled)  # (20, 1)
+
+                actions_out = sampled.squeeze(1)  # (20, H, Da)
+                if self.postprocessor is not None:
+                    actions_out = self.postprocessor(actions_out)
+                sampled_at_keyframes.append({
+                    "t": t,
+                    "actions": actions_out.cpu(),            # (20, H, Da) unnormalized
+                    "q_scores": q_scores.squeeze(-1).cpu(),  # (20,)
+                })
+
+            episodes_out.append({
+                "ep_idx": ep_idx,
+                "q": torch.stack(q_vals),           # (ep_len,)
+                "v": torch.stack(v_vals),           # (ep_len,)
+                "rewards": rewards_ep.cpu(),         # (ep_len,)
+                "terminated": terminated_ep.cpu(),   # (ep_len,)
+                "actions": torch.stack(actions_ep), # (ep_len, n_act, Da)
+                "sampled_actions": sampled_at_keyframes,
+            })
+
+        out_path = self._debug_info_dir / f"debug_info_{itr:06d}.pt"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"itr": itr, "episodes": episodes_out}, out_path)
+        log.info(f"[PARL] Debug info saved → {out_path}")
+
+        if was_training:
+            policy.train()

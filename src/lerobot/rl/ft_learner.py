@@ -12,9 +12,9 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from functools import partial
 from pathlib import Path
 from threading import Event
+import sys
 
 import draccus
 import torch
@@ -23,9 +23,9 @@ from torch.utils.data import DataLoader
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.sampler import EpisodeAwareSampler
-from lerobot.policies.factory import get_policy_class
-from lerobot.rl.algorithm import Algorithm  # noqa: F401 — re-exported for back-compat
-from lerobot.rl.parl_bc import PARLBCAlgorithm, PARLBCConfig
+from lerobot.policies.factory import get_policy_class, make_pre_post_processors
+from lerobot.rl.algorithm import Algorithm, AlgorithmConfig  # noqa: F401 — re-exported for back-compat
+from lerobot.rl.parl_bc import PARLBCConfig  # default algorithm; registers "parl_bc" subclass
 from lerobot.utils.utils import get_safe_torch_device
 
 
@@ -36,8 +36,8 @@ class FTConfig:
     policy_type: str                              # "diffusion", "act", "pi0", etc.
 
     # Dataset
-    dataset_root: str
-    dataset_repo_id: str | None = None            # repo_id for LeRobotDataset; derived from dataset_root if None
+    dataset_repo_id: str                          # repo_id for LeRobotDataset (e.g. "user/dataset")
+    dataset_root: str | None = None               # local path; defaults to HF_LEROBOT_HOME/dataset_repo_id
     delta_timestamps: dict | None = None          # auto-resolved from policy config if None
 
     # Training
@@ -63,8 +63,14 @@ class FTConfig:
     output_dir: str = "outputs/ft"
     checkpoint_freq: int = 1000
 
-    # PARL-BC algorithm config; exposed as --parl_bc.* CLI flags by draccus.
-    parl_bc: PARLBCConfig = field(default_factory=PARLBCConfig)
+    # Algorithm config — fields map to PARLBCConfig by default (e.g. --alg.actor_lr=1e-4).
+    # Override the concrete type with --alg.type=<registered_name> for other algorithms.
+    alg: PARLBCConfig = field(default_factory=PARLBCConfig)
+
+    def __post_init__(self):
+        if self.dataset_root is None:
+            from lerobot.utils.constants import HF_LEROBOT_HOME
+            self.dataset_root = str(HF_LEROBOT_HOME / self.dataset_repo_id)
 
     # Policy CLI overrides (--policy.xxx, injected by __main__ before train())
     policy_cli_overrides: list[str] = field(default_factory=list)
@@ -114,11 +120,7 @@ def _make_dataloader(dataset: LeRobotDataset, cfg: FTConfig) -> DataLoader:
 
 
 def _dataset_repo_id(cfg: FTConfig) -> str:
-    """Derive repo_id from dataset_root if not explicitly set."""
-    if cfg.dataset_repo_id:
-        return cfg.dataset_repo_id
-    parts = Path(cfg.dataset_root).parts
-    return f"{parts[-2]}/{parts[-1]}" if len(parts) >= 2 else parts[-1]
+    return cfg.dataset_repo_id
 
 
 def _load_dataset(cfg: FTConfig) -> LeRobotDataset:
@@ -176,13 +178,34 @@ def train(
     policy.to(device)
     policy.train()
 
-    # Auto-resolve delta_timestamps and drop_n_last_frames from policy config
+    if cfg.drop_n_last_frames == 0:
+        cfg.drop_n_last_frames = getattr(policy.config, "horizon", 0)
+
+    algorithm = algorithm_cls(policy)
+
+    # ---- Block until enough frames are on disk ----
+    while True:
+        if shutdown_event is not None and shutdown_event.is_set():
+            return
+        try:
+            n_frames = _read_total_frames(dataset_root)
+        except (FileNotFoundError, KeyError):
+            n_frames = 0
+        if n_frames >= cfg.min_frames_before_training:
+            break
+        logging.info(
+            f"[FT_LEARNER] Waiting for data — {n_frames}/{cfg.min_frames_before_training} frames"
+        )
+        time.sleep(5.0)
+
+    dataset = _load_dataset(cfg)
+
+    # Auto-resolve delta_timestamps now that the dataset is available
     if cfg.delta_timestamps is None:
         from lerobot.datasets.factory import resolve_delta_timestamps
-        from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
         from lerobot.utils.constants import OBS_PREFIX
 
-        ds_meta = LeRobotDatasetMetadata(_dataset_repo_id(cfg), root=dataset_root)
+        ds_meta = dataset.meta
         delta_timestamps = resolve_delta_timestamps(policy.config, ds_meta) or {}
 
         # Add next.* keys for TD backup (n_obs_steps window ending n_action_steps ahead)
@@ -199,28 +222,37 @@ def train(
         cfg.delta_timestamps = delta_timestamps or None
         logging.info(f"[FT_LEARNER] Auto-resolved delta_timestamps: {list(cfg.delta_timestamps or {})}")
 
-    if cfg.drop_n_last_frames == 0:
-        cfg.drop_n_last_frames = getattr(policy.config, "horizon", 0)
-
-    algorithm = algorithm_cls(policy)
-
-    # ---- Block until enough frames are on disk ----
-    while True:
-        if shutdown_event is not None and shutdown_event.is_set():
-            return
+        # Reload dataset with resolved delta_timestamps
         dataset = _load_dataset(cfg)
-        if len(dataset) >= cfg.min_frames_before_training:
-            break
-        logging.info(
-            f"[FT_LEARNER] Waiting for data — {len(dataset)}/{cfg.min_frames_before_training} frames"
-        )
-        time.sleep(5.0)
 
-    known_frames = _read_total_frames(dataset_root)
+    preprocessor, postprocessor = make_pre_post_processors(
+        policy_cfg=policy.config,
+        pretrained_path=cfg.pretrained_name_or_path,
+        preprocessor_overrides={
+            "device_processor": {"device": device.type},
+            "normalizer_processor": {
+                "stats": dataset.meta.stats,
+                "features": {**policy.config.input_features, **policy.config.output_features},
+                "norm_map": policy.config.normalization_mapping,
+            },
+        },
+        postprocessor_overrides={
+            "unnormalizer_processor": {
+                "stats": dataset.meta.stats,
+                "features": policy.config.output_features,
+                "norm_map": policy.config.normalization_mapping,
+            },
+        },
+    )
+    algorithm.preprocessor = preprocessor
+    algorithm.postprocessor = postprocessor
+
+    known_frames = 0
+    initial_frames = _read_total_frames(dataset_root)
     dataloader = _make_dataloader(dataset, cfg)
 
     logging.info(
-        f"[FT_LEARNER] Starting — {known_frames} frames on disk, "
+        f"[FT_LEARNER] Starting — {initial_frames} frames on disk, "
         f"batch_size={cfg.batch_size}, device={cfg.device}"
     )
 
@@ -290,21 +322,27 @@ def serve(cfg: FTConfig):
             --env_steps_per_itr=100 \\
             --weight_push_freq_itr=5 \\
             --output_dir=outputs/rl/pick_and_place \\
-            --parl_bc.num_ft_train_steps=100 \\
-            --parl_bc.actor_lr=1e-4 \\
-            --parl_bc.critic_lr=1e-4 \\
-            --parl_bc.n_batch_per_itr=10 \\
-            --parl_bc.n_critic_warmup_itr=5 \\
-            --parl_bc.freeze_image_encoder=True \\
+            --alg.type=parl_bc \\
+            --alg.num_ft_train_steps=100 \\
+            --alg.actor_lr=1e-4 \\
+            --alg.critic_lr=1e-4 \\
+            --alg.n_batch_per_itr=10 \\
+            --alg.n_critic_warmup_itr=5 \\
+            --alg.freeze_image_encoder=True \\
             --policy.dinov3_hub_repo=facebookresearch/dinov2 \\
             --policy.dinov3_hub_weights=dinov2_vits14
     """
-    logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s")
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.setLevel(logging.INFO)
+    _h = logging.StreamHandler(sys.stdout)
+    _h.setFormatter(logging.Formatter("[%(asctime)s] %(message)s"))
+    root.addHandler(_h)
 
     if getattr(serve, "_policy_cli_overrides", None):
         cfg.policy_cli_overrides = serve._policy_cli_overrides
 
-    train(cfg, algorithm_cls=partial(PARLBCAlgorithm, cfg=cfg.parl_bc))
+    train(cfg, algorithm_cls=cfg.alg.make_algorithm)
 
 
 if __name__ == "__main__":
