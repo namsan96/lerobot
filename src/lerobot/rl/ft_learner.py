@@ -11,7 +11,6 @@ Design:
 import json
 import logging
 import time
-from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -25,6 +24,8 @@ from torch.utils.data import DataLoader
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.policies.factory import get_policy_class
+from lerobot.rl.algorithm import Algorithm  # noqa: F401 — re-exported for back-compat
+from lerobot.rl.parl_bc import PARLBCAlgorithm, PARLBCConfig
 from lerobot.utils.utils import get_safe_torch_device
 
 
@@ -51,8 +52,8 @@ class FTConfig:
     # Drop last N frames per episode from sampling; auto-set from policy config n_action_steps if 0
     drop_n_last_frames: int = 0
 
-    # Dataset reload: re-instantiate after this many new episodes arrive
-    reload_every_n_episodes: int = 1
+    # Dataset reload: wait until this many new frames arrive before each training iteration
+    env_steps_per_itr: int = 100
 
     # Weight push: push every N iterations, but not before weight_push_warmup_itr
     weight_push_freq_itr: int = 10
@@ -61,6 +62,9 @@ class FTConfig:
     # Checkpointing
     output_dir: str = "outputs/ft"
     checkpoint_freq: int = 1000
+
+    # PARL-BC algorithm config; exposed as --parl_bc.* CLI flags by draccus.
+    parl_bc: PARLBCConfig = field(default_factory=PARLBCConfig)
 
     # Policy CLI overrides (--policy.xxx, injected by __main__ before train())
     policy_cli_overrides: list[str] = field(default_factory=list)
@@ -73,48 +77,23 @@ def make_policy(cfg: FTConfig, policy_cli_overrides: list[str] | None = None) ->
     return policy
 
 
-class Algorithm(ABC):
-    """
-    Owns the optimizer(s) for a given policy. Responsible for one full outer iteration.
-
-    Subclasses implement different RL / IL algorithms (BC, SAC, TD3, REINFORCE, ...).
-    The policy is created externally via make_policy() and passed in, so the same
-    policy instance is shared between the Algorithm and the training loop (for weight push).
-
-    The algorithm owns its own data iterator and pulls as many batches as it needs per call.
-    """
-
-    def __init__(self, policy: nn.Module) -> None:
-        self._policy = policy
-
-    @property
-    def policy(self) -> nn.Module:
-        return self._policy
-
-    @abstractmethod
-    def update(self, loader: DataLoader, itr: int) -> dict:
-        """
-        Run one full outer iteration (however many gradient steps the algorithm needs).
-
-        Args:
-            loader: DataLoader for the current dataset (may change across calls on reload).
-            itr: Outer iteration index.
-
-        Returns:
-            Info dict to be logged.
-        """
-        ...
-
-
 # ---------------------------------------------------------------------------
 # Dataset helpers
 # ---------------------------------------------------------------------------
 
-def _read_total_episodes(dataset_root: Path) -> int:
-    """Cheaply read episode count from info.json without touching parquet files."""
+def _read_dataset_info(dataset_root: Path) -> dict:
+    """Cheaply read info.json without touching parquet files."""
     info_path = dataset_root / "meta" / "info.json"
     with open(info_path) as f:
-        return json.load(f)["total_episodes"]
+        return json.load(f)
+
+
+def _read_total_frames(dataset_root: Path) -> int:
+    return _read_dataset_info(dataset_root)["total_frames"]
+
+
+def _read_total_episodes(dataset_root: Path) -> int:
+    return _read_dataset_info(dataset_root)["total_episodes"]
 
 
 def _make_dataloader(dataset: LeRobotDataset, cfg: FTConfig) -> DataLoader:
@@ -207,14 +186,15 @@ def train(
         delta_timestamps = resolve_delta_timestamps(policy.config, ds_meta) or {}
 
         # Add next.* keys for TD backup (n_obs_steps window ending n_action_steps ahead)
-        pcfg = policy.config
-        n_obs = getattr(pcfg, "n_obs_steps", None)
-        horizon = getattr(pcfg, "horizon", None)
-        if n_obs is not None and horizon is not None:
-            next_indices = list(range(horizon + 1 - n_obs, horizon + 1))
-            for key in list(delta_timestamps):
-                if key.startswith(OBS_PREFIX):
-                    delta_timestamps[f"next.{key}"] = [i / ds_meta.fps for i in next_indices]
+        n_obs = policy.config.n_obs_steps
+        horizon = policy.config.horizon
+        next_obs_indices = list(range(horizon + 1 - n_obs, horizon + 1))
+        for key in list(delta_timestamps):
+            if key.startswith(OBS_PREFIX):
+                delta_timestamps[f"next.{key}"] = [i / ds_meta.fps for i in next_obs_indices]
+
+        delta_timestamps["reward"] = [i / ds_meta.fps for i in range(horizon)]
+        delta_timestamps["terminated"] = [horizon / ds_meta.fps]
 
         cfg.delta_timestamps = delta_timestamps or None
         logging.info(f"[FT_LEARNER] Auto-resolved delta_timestamps: {list(cfg.delta_timestamps or {})}")
@@ -228,7 +208,6 @@ def train(
     while True:
         if shutdown_event is not None and shutdown_event.is_set():
             return
-        known_episodes = _read_total_episodes(dataset_root)
         dataset = _load_dataset(cfg)
         if len(dataset) >= cfg.min_frames_before_training:
             break
@@ -237,10 +216,11 @@ def train(
         )
         time.sleep(5.0)
 
+    known_frames = _read_total_frames(dataset_root)
     dataloader = _make_dataloader(dataset, cfg)
 
     logging.info(
-        f"[FT_LEARNER] Starting — {known_episodes} episodes, {len(dataset)} frames, "
+        f"[FT_LEARNER] Starting — {known_frames} frames on disk, "
         f"batch_size={cfg.batch_size}, device={cfg.device}"
     )
 
@@ -252,17 +232,23 @@ def train(
             logging.info("[FT_LEARNER] Shutdown requested, exiting.")
             break
 
-        # ---- Reload dataset if new episodes arrived ----
-        current_episodes = _read_total_episodes(dataset_root)
-        if current_episodes - known_episodes >= cfg.reload_every_n_episodes:
+        # ---- Wait until env_steps_per_itr new frames have arrived ----
+        while True:
+            if shutdown_event is not None and shutdown_event.is_set():
+                break
+            current_frames = _read_total_frames(dataset_root)
+            new_frames = current_frames - known_frames
+            if new_frames >= cfg.env_steps_per_itr:
+                break
             logging.info(
-                f"[FT_LEARNER] {current_episodes - known_episodes} new episode(s) detected "
-                f"({known_episodes} → {current_episodes}), reloading dataset"
+                f"[FT_LEARNER] Waiting for env steps — {new_frames}/{cfg.env_steps_per_itr} new frames"
             )
-            known_episodes = current_episodes
-            dataset = _load_dataset(cfg)
-            dataloader = _make_dataloader(dataset, cfg)
-            logging.info(f"[FT_LEARNER] Dataset reloaded — {len(dataset)} frames total")
+            time.sleep(1.0)
+
+        known_frames = current_frames
+        dataset = _load_dataset(cfg)
+        dataloader = _make_dataloader(dataset, cfg)
+        logging.info(f"[FT_LEARNER] Dataset reloaded — {len(dataset)} frames total ({new_frames} new)")
 
         # ---- One outer iteration (algorithm decides how many gradient steps) ----
         itr_info = algorithm.update(dataloader, itr)
@@ -291,24 +277,34 @@ def serve(cfg: FTConfig):
     """
     CLI entrypoint for PARL-BC fine-tuning.
 
-    Example:
+    Example (fine-tune all 100 denoising steps, freeze image encoder):
+
         python -m lerobot.rl.ft_learner \\
+            --pretrained_name_or_path=tw_outputs/diffusion/pretrained_model \\
             --policy_type=diffusion \\
-            --pretrained_name_or_path=tw_outputs/.../pretrained_model \\
             --dataset_root=/data/recordings/pick_and_place \\
             --device=cuda \\
+            --batch_size=64 \\
+            --num_workers=4 \\
+            --min_frames_before_training=500 \\
+            --env_steps_per_itr=100 \\
+            --weight_push_freq_itr=5 \\
             --output_dir=outputs/rl/pick_and_place \\
-            --policy.dinov3_hub_repo=... \\
-            --policy.dinov3_hub_weights=...
+            --parl_bc.num_ft_train_steps=100 \\
+            --parl_bc.actor_lr=1e-4 \\
+            --parl_bc.critic_lr=1e-4 \\
+            --parl_bc.n_batch_per_itr=10 \\
+            --parl_bc.n_critic_warmup_itr=5 \\
+            --parl_bc.freeze_image_encoder=True \\
+            --policy.dinov3_hub_repo=facebookresearch/dinov2 \\
+            --policy.dinov3_hub_weights=dinov2_vits14
     """
-    from lerobot.rl.parl_bc import PARLBCAlgorithm, PARLBCConfig
-
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s")
 
     if getattr(serve, "_policy_cli_overrides", None):
         cfg.policy_cli_overrides = serve._policy_cli_overrides
 
-    train(cfg, algorithm_cls=partial(PARLBCAlgorithm, cfg=PARLBCConfig()))
+    train(cfg, algorithm_cls=partial(PARLBCAlgorithm, cfg=cfg.parl_bc))
 
 
 if __name__ == "__main__":

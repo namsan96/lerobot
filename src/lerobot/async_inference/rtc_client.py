@@ -164,15 +164,16 @@ class RobotClient:
         obs_features = hw_to_dataset_features(self.robot.observation_features, OBS_STR, use_video=use_videos)
         action_features = hw_to_dataset_features(self.robot.action_features, ACTION, use_video=use_videos)
         reward_feature = {"reward": {"dtype": "float32", "shape": (1,), "names": ["reward"]}}
+        terminated_feature = {"terminated": {"dtype": "float32", "shape": (1,), "names": ["terminated"]}}
         debug_features = {
             "debug.elapsed_ms": {"dtype": "float32", "shape": (1,), "names": ["elapsed_ms"]},
             "debug.chunk_idx": {"dtype": "float32", "shape": (1,), "names": ["chunk_idx"]},
         }
-        return combine_feature_dicts(obs_features, action_features, reward_feature, debug_features)
+        return combine_feature_dicts(obs_features, action_features, reward_feature, terminated_feature, debug_features)
 
-    def _prompt_reward(self) -> float:
+    def _prompt_terminated(self) -> float:
         while True:
-            val = input("Episode reward (0 or 1): ").strip()
+            val = input("Terminated? (0=False, 1=True): ").strip()
             if val in ("0", "1"):
                 return float(val)
             print("Please enter 0 or 1.")
@@ -462,16 +463,19 @@ class RobotClient:
                 action_dict = self.control_loop_action(action_chunk[chunk_idx], verbose)
                 _performed_action = action_dict
 
-                # Save frame to dataset (if recording); reward=0 for all steps, patched at episode end
+                # Save frame to dataset (if recording); reward set per-step via '1' key
                 if self.dataset is not None:
                     obs_frame = build_dataset_frame(self.dataset.features, raw_obs, prefix=OBS_STR)
                     action_frame = build_dataset_frame(self.dataset.features, action_dict, prefix=ACTION)
                     elapsed_ms = (time.perf_counter() - control_loop_start) * 1000
+                    step_reward = 1.0 if self.events["reward_1"] else 0.0
+                    self.events["reward_1"] = False
                     self.dataset.add_frame({
                         **obs_frame,
                         **action_frame,
                         "task": task,
-                        "reward": np.array([0.0], dtype=np.float32),
+                        "reward": np.array([step_reward], dtype=np.float32),
+                        "terminated": np.array([0.0], dtype=np.float32),
                         "debug.elapsed_ms": np.array([elapsed_ms], dtype=np.float32),
                         "debug.chunk_idx": np.array([chunk_idx], dtype=np.float32),
                     })
@@ -498,10 +502,10 @@ class RobotClient:
                     self.logger.info("Left arrow: discarding episode buffer, will rerecord")
                     self.dataset.clear_episode_buffer()
                 else:
-                    reward = self._prompt_reward()
-                    self.dataset.episode_buffer["reward"][-1] = np.array([reward], dtype=np.float32)
+                    terminated = self._prompt_terminated()
+                    self.dataset.episode_buffer["terminated"][-1] = np.array([terminated], dtype=np.float32)
                     self.dataset.save_episode()
-                    self.logger.info(f"Episode {self.dataset.num_episodes} saved with reward={reward}")
+                    self.logger.info(f"Episode {self.dataset.num_episodes} saved with terminated={bool(terminated)}")
                     input("Enter to start next episode")
             else:
                 input("Enter to restart")

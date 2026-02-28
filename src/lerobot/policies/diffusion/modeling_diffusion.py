@@ -275,7 +275,18 @@ class DiffusionModel(nn.Module):
         generator: torch.Generator | None = None,
         noise: Tensor | None = None,
         action_cond=None,
+        pretrained_unet=None,
+        num_ft_train_steps: int = 0,
+        noise_injection_std: float = 0.0,
     ) -> Tensor:
+        """
+        pretrained_unet: frozen pre-trained UNet used for t >= num_ft_train_steps
+                         (high-noise coarse denoising steps). None = use self.unet throughout.
+        num_ft_train_steps: timestep cutoff. Steps with t < num_ft_train_steps use self.unet
+                            (fine-tuned); steps with t >= num_ft_train_steps use pretrained_unet.
+        noise_injection_std: ignored for DDPM (noise is handled by the scheduler); used by FlowModel.
+        """
+        assert noise_injection_std == 0.0, "Noise injection is not supported for DiffusionPolicy"
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
 
@@ -297,8 +308,14 @@ class DiffusionModel(nn.Module):
         self.noise_scheduler.set_timesteps(self.num_inference_steps)
 
         for t in self.noise_scheduler.timesteps:
+            # Use frozen pretrained UNet for high-noise steps, fine-tuned UNet for refinement steps.
+            unet = (
+                pretrained_unet
+                if pretrained_unet is not None and t >= num_ft_train_steps
+                else self.unet
+            )
             # Predict model output.
-            model_output = self.unet(
+            model_output = unet(
                 sample,
                 torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device),
                 global_cond=global_cond,
@@ -526,7 +543,8 @@ class FlowModel(DiffusionModel):
         global_cond: Tensor | None = None,
         generator: torch.Generator | None = None,
         noise: Tensor | None = None,
-        action_cond=None
+        action_cond=None,
+        noise_injection_std: float = 0.0,
     ) -> Tensor:
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
@@ -610,7 +628,9 @@ class FlowModel(DiffusionModel):
                 )
 
             sample = sample + vel / self.num_inference_steps
-        
+            if noise_injection_std > 0.0:
+                sample = sample + noise_injection_std * torch.randn_like(sample)
+
         if self.config.rtc_type == 'train_time' and action_cond is not None:
             sample[:, :self.config.rtc_delay] = action_cond[:, :self.config.rtc_delay]
 

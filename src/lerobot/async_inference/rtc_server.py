@@ -13,15 +13,19 @@
 # limitations under the License.
 
 """
-Example:
-```shell
-python -m lerobot.async_inference.policy_server \
-     --host=127.0.0.1 \
-     --port=8080 \
-     --fps=30 \
-     --inference_latency=0.033 \
-     --obs_queue_timeout=1
-```
+Example (diffusion policy with DINOv3, online RL weight hot-swap from ft_learner):
+
+    python -m lerobot.async_inference.rtc_server \\
+        --pretrained_name_or_path=tw_outputs/diffusion/pretrained_model \\
+        --policy_type=diffusion \\
+        --host=0.0.0.0 \\
+        --port=8080 \\
+        --device=cuda \\
+        --fps=30 \\
+        --weights_watch_dir=outputs/rl/pick_and_place \\
+        --weights_check_interval=5.0 \\
+        --policy.dinov3_hub_repo=facebookresearch/dinov2 \\
+        --policy.dinov3_hub_weights=dinov2_vits14
 """
 
 import logging

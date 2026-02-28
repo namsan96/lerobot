@@ -20,7 +20,7 @@ from lerobot.policies.diffusion.modeling_parl_diffusion import (
     PARLDiffusionConfig,
     PARLDiffusionPolicy,
 )
-from lerobot.rl.ft_learner import Algorithm
+from lerobot.rl.algorithm import Algorithm
 
 log = logging.getLogger(__name__)
 
@@ -44,6 +44,11 @@ class PARLBCConfig:
 
     # Number of outer iterations to train critic only before actor updates begin
     n_critic_warmup_itr: int = 0
+
+    # Number of fine-tuned denoising steps: t < num_ft_train_steps uses ft_diffusion,
+    # t >= num_ft_train_steps uses the frozen pretrained UNet.
+    # Must equal num_train_timesteps (all steps ft) OR freeze_image_encoder must be True.
+    num_ft_train_steps: int = None  # required — no default
 
     # Run actor update only every N outer iterations (1 = every iteration)
     policy_update_period: int = 1
@@ -95,11 +100,28 @@ class PARLBCAlgorithm(Algorithm):
 
         super().__init__(policy)
 
+        if self.cfg.num_ft_train_steps is None:
+            raise ValueError("PARLBCConfig.num_ft_train_steps must be set explicitly.")
+        num_train_timesteps = policy.config.num_train_timesteps
+        if self.cfg.num_ft_train_steps < num_train_timesteps and not self.cfg.freeze_image_encoder:
+            raise ValueError(
+                f"num_ft_train_steps={self.cfg.num_ft_train_steps} < num_train_timesteps={num_train_timesteps} "
+                "uses a frozen pretrained UNet for high-noise steps, which limits the fine-tuning scope. "
+                "freeze_image_encoder must be True in this case to prevent encoder drift."
+            )
+
         # ft_diffusion: frozen reference diffusion network for sampling.
         # Gradients disabled; synced from policy.diffusion at end of each outer iteration.
         self.ft_diffusion = copy.deepcopy(policy.diffusion)
         self.ft_diffusion.eval()
         for p in self.ft_diffusion.parameters():
+            p.requires_grad_(False)
+
+        # pretrained_unet: forever-frozen original UNet used for t >= num_ft_train_steps.
+        # Captures the initial pretrained weights before any fine-tuning begins.
+        self.pretrained_unet = copy.deepcopy(policy.diffusion.unet)
+        self.pretrained_unet.eval()
+        for p in self.pretrained_unet.parameters():
             p.requires_grad_(False)
 
         # Optionally freeze image encoder (exclude from actor updates)
@@ -208,7 +230,11 @@ class PARLBCAlgorithm(Algorithm):
     # ------------------------------------------------------------------
 
     def _actor_update(self, batch: dict) -> dict:
-        actor_loss, stats = self.policy.actor_loss(batch, self.ft_diffusion)
+        actor_loss, stats = self.policy.actor_loss(
+            batch, self.ft_diffusion,
+            pretrained_unet=self.pretrained_unet,
+            num_ft_train_steps=self.cfg.num_ft_train_steps,
+        )
 
         self.actor_optimizer.zero_grad()
         actor_loss.backward()

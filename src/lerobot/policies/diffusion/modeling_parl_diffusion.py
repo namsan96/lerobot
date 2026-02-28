@@ -51,6 +51,7 @@ class PARLDiffusionConfig:
     # Sampling
     n_samples: int = 16
     distil_temp: float = 0.0        # 0 = argmax; >0 = softmax temperature selection
+    noise_injection_std: float = 0.0  # additive noise per denoising step (flow matching)
 
     # IQL critic
     expectile: float = 0.7          # asymmetric weight for V expectile regression
@@ -67,8 +68,8 @@ class PARLDiffusionConfig:
     v_hidden_dims: tuple[int, ...] = (256, 256)
 
     # Dataset keys
-    reward_key: str = "next.reward"
-    done_key: str = "next.done"
+    reward_key: str = "reward"
+    terminated_key: str = "terminated"
     # Optional: if these keys exist in the batch, TD backup is used for Q target.
     next_obs_state_key: str = "next.observation.state"
     next_obs_image_prefix: str = "next.observation.images"
@@ -381,7 +382,8 @@ class PARLDiffusionPolicy(DiffusionPolicy):
             if action_cond is not None else None
         )
         sampled = dm.conditional_sample(
-            n_samples * B, global_cond=global_cond_n, action_cond=action_cond_n
+            n_samples * B, global_cond=global_cond_n, action_cond=action_cond_n,
+            noise_injection_std=self.parl_cfg.noise_injection_std,
         ).view(n_samples, B, self._horizon, self._action_dim)
 
         q_scores = self._q_score_samples(encoder_tokens, state_flat, sampled)
@@ -451,8 +453,22 @@ class PARLDiffusionPolicy(DiffusionPolicy):
 
         v_feat = torch.cat([state_flat, cls_tokens_flat], dim=-1)  # (B, v_in_dim)
         action = batch[ACTION][:, :self._n_act]                    # (B, n_act, Da)
-        reward = batch[pcfg.reward_key].float()                    # (B,)
-        done = batch.get(pcfg.done_key, torch.zeros_like(reward)).float()
+
+        # Gamma-discounted H-step return: G = Σ_{t=0}^{H-1} γ^t * r_t  →  (B,)
+        reward_seq = batch[pcfg.reward_key].float().squeeze(-1)    # (B, H, 1) → (B, H)
+        B = reward_seq.shape[0]
+        gamma_weights = pcfg.gamma ** torch.arange(
+            self._horizon, device=reward_seq.device, dtype=reward_seq.dtype
+        )                                                           # (H,)
+        reward = (reward_seq * gamma_weights).sum(dim=-1)          # (B,)
+
+        # terminated at step H: (B, 1, 1) → (B,)
+        terminated_raw = batch.get(pcfg.terminated_key)
+        terminated = (
+            terminated_raw.float().squeeze(-1).squeeze(-1)
+            if terminated_raw is not None
+            else torch.zeros(B, device=reward.device, dtype=reward.dtype)
+        )
 
         # V loss: expectile regression against frozen target Q
         with torch.no_grad():
@@ -462,13 +478,14 @@ class PARLDiffusionPolicy(DiffusionPolicy):
         weights = torch.where(diffs > 0, pcfg.expectile, 1.0 - pcfg.expectile)
         v_loss = (weights * diffs.pow(2)).mean()
 
-        # Q loss: TD backup with V(s')
+        # Q loss: H-step TD backup — G + γ^H * (1 - terminated) * V(s_H)
         next_obs = self._build_next_obs_batch(batch)
         with torch.no_grad():
-            next_enc_tokens, next_state_flat, next_cls_flat = self.encode_obs(next_obs)
+            _, next_state_flat, next_cls_flat = self.encode_obs(next_obs)
             next_v_feat = torch.cat([next_state_flat, next_cls_flat], dim=-1)
             next_v = self.critic_v(next_v_feat)                                # (B,)
-        q_target = reward + pcfg.gamma * (1.0 - done) * next_v
+        gamma_H = pcfg.gamma ** self._horizon
+        q_target = reward + gamma_H * (1.0 - terminated) * next_v
 
         q = self.critic_q(encoder_tokens, state_flat, action)                  # (B,)
         q_loss = F.mse_loss(q, q_target.detach())
@@ -508,7 +525,7 @@ class PARLDiffusionPolicy(DiffusionPolicy):
     # Actor loss (BC distillation toward Q-optimal sample)
     # ------------------------------------------------------------------
 
-    def actor_loss(self, batch: dict, ft_diffusion: nn.Module) -> tuple[Tensor, dict]:
+    def actor_loss(self, batch: dict, ft_diffusion: nn.Module, pretrained_unet=None, num_ft_train_steps: int = 0) -> tuple[Tensor, dict]:
         """
         1. Sample n_samples full-horizon actions from ft_diffusion (frozen reference, no grad).
         2. Q-score on n_action_steps portion using current policy's obs encoding (no grad).
@@ -530,7 +547,10 @@ class PARLDiffusionPolicy(DiffusionPolicy):
             obs_n = _expand_obs(obs, n)
             global_cond_n = ft_diffusion._prepare_global_conditioning(obs_n)
             sampled = ft_diffusion.conditional_sample(                 # (n*B, H, Da)
-                n * B, global_cond=global_cond_n
+                n * B, global_cond=global_cond_n,
+                pretrained_unet=pretrained_unet,
+                num_ft_train_steps=num_ft_train_steps,
+                noise_injection_std=pcfg.noise_injection_std,
             ).view(n, B, self._horizon, self._action_dim)
 
             q_scores = self._q_score_samples(encoder_tokens, state_flat, sampled)  # (n, B)
