@@ -43,6 +43,7 @@ from lerobot.policies.utils import (
     populate_queues,
 )
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
+from lerobot.configs.types import NormalizationMode
 
 
 class DiffusionPolicy(PreTrainedPolicy):
@@ -851,6 +852,7 @@ class DiffusionDinoV3Encoder(nn.Module):
     IMAGENET_STD = (0.229, 0.224, 0.225)
 
     def __init__(self, config: DiffusionConfig):
+        assert config.normalization_mapping["VISUAL"] == NormalizationMode.IDENTITY
         super().__init__()
         repo_dir = getattr(config, "dinov3_hub_repo", None)
         if not repo_dir:
