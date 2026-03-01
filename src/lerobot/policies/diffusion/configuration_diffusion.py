@@ -264,7 +264,6 @@ class DiffusionConfig(PreTrainedConfig):
         if self.speedup_factor > 1:
             assert self.n_obs_steps == 1
             indices =  list(range(self.speedup_factor - 1, self.speedup_factor * self.horizon, self.speedup_factor))
-            print(len(indices))
             assert len(indices) == self.horizon, f"Expected {self.horizon} indices, got {len(indices)}"
             return indices
         return list(range(1 - self.n_obs_steps, 1 - self.n_obs_steps + self.horizon))
