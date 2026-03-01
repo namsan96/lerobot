@@ -111,6 +111,7 @@ class DiffusionConfig(PreTrainedConfig):
     n_action_steps: int = 8
 
     speedup_factor: int = 1
+    speedaug: bool = False
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -261,6 +262,10 @@ class DiffusionConfig(PreTrainedConfig):
 
     @property
     def action_delta_indices(self) -> list:
+        if self.speedaug:
+            assert self.n_obs_steps == 1, "speedaug requires n_obs_steps == 1"
+            assert self.speedup_factor > 1, "speedaug requires speedup_factor > 1"
+            return list(range(0, self.horizon * self.speedup_factor))
         if self.speedup_factor > 1:
             assert self.n_obs_steps == 1
             indices =  list(range(self.speedup_factor - 1, self.speedup_factor * self.horizon, self.speedup_factor))

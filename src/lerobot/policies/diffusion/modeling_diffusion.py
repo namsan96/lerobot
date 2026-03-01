@@ -149,6 +149,8 @@ class DiffusionPolicy(PreTrainedPolicy):
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+        if self.config.speedaug:
+            batch = self.diffusion._apply_speed_augmentation(batch)
         loss = self.diffusion.compute_loss(batch)
         # no output_dict so returning None
         return loss, None
@@ -455,6 +457,46 @@ class DiffusionModel(nn.Module):
             actions = actions[:, start:end]
 
         return actions
+
+    def _apply_speed_augmentation(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Downsample the long action sequence (horizon * speedup_factor) to (horizon,).
+
+        For each batch element, samples v ~ Uniform(1, speedup_factor) and linearly
+        interpolates into the long sequence at positions v * [1, ..., horizon] - 1.
+        """
+        actions = batch[ACTION]  # (B, H_long, action_dim)
+        B, H_long, action_dim = actions.shape
+        H = self.config.horizon
+        device = actions.device
+
+        # Sample per-element speed: v ~ Uniform(1, speedup_factor)
+        v = 1.0 + (self.config.speedup_factor - 1.0) * torch.rand(B, device=device)  # (B,)
+
+        # Fractional source indices: ffw_indices[b, t] = v[b] * (t+1) - 1 for t in [0, H)
+        step_indices = torch.arange(1, H + 1, dtype=torch.float32, device=device)  # (H,)
+        ffw_indices = v[:, None] * step_indices[None, :] - 1  # (B, H)
+        ffw_indices = ffw_indices.clamp(0, H_long - 1)
+
+        # Linear interpolation via floor/ceil gather
+        floor_idx = ffw_indices.long()  # (B, H)
+        ceil_idx = (floor_idx + 1).clamp(max=H_long - 1)  # (B, H)
+        frac = (ffw_indices - floor_idx.float()).unsqueeze(-1)  # (B, H, 1)
+
+        expand = lambda idx: idx.unsqueeze(-1).expand(-1, -1, action_dim)
+        floor_actions = actions.gather(1, expand(floor_idx))  # (B, H, action_dim)
+        ceil_actions = actions.gather(1, expand(ceil_idx))    # (B, H, action_dim)
+        downsampled_actions = (1 - frac) * floor_actions + frac * ceil_actions
+
+        batch = dict(batch)
+        batch[ACTION] = downsampled_actions
+
+        assert self.config.do_mask_loss_for_padding == False
+        # didnt check this logic
+        # if "action_is_pad" in batch:
+        #     is_pad = batch["action_is_pad"]  # (B, H_long), bool
+        #     batch["action_is_pad"] = is_pad.gather(1, floor_idx) | is_pad.gather(1, ceil_idx)
+
+        return batch
 
     def compute_loss(self, batch: dict[str, Tensor], max_timestep: int | None = None) -> Tensor:
         """
