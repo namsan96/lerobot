@@ -233,7 +233,7 @@ class SO101Follower(Robot):
         self,
         acceleration: int = 10,
         timeout_s: float = 15.0,
-        poll_period_s: float = 0.1,
+        poll_period_s: float = 0.2,
         pos_tol: float = 2.0,
     ) -> None:
         """Slowly move the arm to the home/rest position.
@@ -261,7 +261,7 @@ class SO101Follower(Robot):
             self.bus.write("Acceleration", motor, acceleration, normalize=False)
 
         # Waypoint: move to intermediate position first
-        current_pos = self.bus.sync_read("Present_Position")
+        current_pos = self.bus.sync_read("Present_Position", num_retry=3)
         waypoint = {
             "shoulder_pan": current_pos["shoulder_pan"],
             "shoulder_lift": -100.0,
@@ -275,7 +275,7 @@ class SO101Follower(Robot):
 
         start = time.perf_counter()
         while time.perf_counter() - start < timeout_s:
-            present_pos = self.bus.sync_read("Present_Position")
+            present_pos = self.bus.sync_read("Present_Position", num_retry=3)
             if all(abs(present_pos[m] - waypoint[m]) <= pos_tol for m in waypoint):
                 logger.info(f"{self} reached waypoint position.")
                 break
@@ -293,7 +293,7 @@ class SO101Follower(Robot):
         # Poll until all joints converge or the timeout fires
         start = time.perf_counter()
         while time.perf_counter() - start < timeout_s:
-            present_pos = self.bus.sync_read("Present_Position")
+            present_pos = self.bus.sync_read("Present_Position", num_retry=3)
             if all(abs(present_pos[m] - self.HOME_POS[m]) <= pos_tol for m in self.HOME_POS):
                 logger.info(f"{self} reached home position.")
                 break
