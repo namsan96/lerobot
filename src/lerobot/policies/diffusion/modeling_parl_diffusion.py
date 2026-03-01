@@ -51,7 +51,7 @@ log = logging.getLogger(__name__)
 @dataclass
 class PARLDiffusionConfig(DiffusionConfig):
     # Sampling
-    n_samples: int = 16
+    n_samples: int = 5
     distil_temp: float = 0.0        # 0 = argmax; >0 = softmax temperature selection
     noise_injection_std: float = 0.0  # additive noise per denoising step (flow matching)
 
@@ -61,9 +61,9 @@ class PARLDiffusionConfig(DiffusionConfig):
     tau: float = 0.005              # EMA rate for target Q network
 
     # Q Transformer architecture (independent of policy DiT config)
-    q_hidden_dim: int = 256
+    q_hidden_dim: int = 128
     q_n_heads: int = 4
-    q_n_layers: int = 4
+    q_n_layers: int = 2
     q_dropout: float = 0.0
 
     # V network MLP hidden dims
@@ -188,8 +188,12 @@ def _stack_images(batch: dict, policy: "PARLDiffusionPolicy") -> dict:
 
 
 def _expand_obs(obs: dict, n: int) -> dict:
-    """Repeat obs n times along the batch dim: (B, ...) → (n*B, ...)."""
-    return {k: v.repeat(n, *((1,) * (v.dim() - 1))) for k, v in obs.items()}
+    """Repeat obs n times along the batch dim: (B, ...) → (n*B, ...).
+    Non-tensor values (e.g. floats/bools injected by transition_to_batch) are passed through."""
+    return {
+        k: v.repeat(n, *((1,) * (v.dim() - 1))) if isinstance(v, torch.Tensor) else v
+        for k, v in obs.items()
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -377,10 +381,12 @@ class PARLDiffusionPolicy(DiffusionPolicy):
         Falls back to plain diffusion sampling until Q weights have been loaded
         from ft_learner (i.e. until _q_initialized is set True by the weights watcher).
         """
+        # Rebuild batch from queues: OBS_IMAGES is already the stacked (B, s, n_cams, C, H, W)
+        # tensor — individual camera keys (e.g. "observation.images.top") are no longer present.
         batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
         if not self._q_initialized:
             return self.diffusion.generate_actions(batch, noise=noise, full_length=full_length, action_cond=action_cond, noise_injection_std=self.config.noise_injection_std)
-        batch = _stack_images(batch, self)
+        # Do NOT call _stack_images here: OBS_IMAGES is already stacked from the queues above.
         return self._sample_and_select(batch, self.config.n_samples, full_length, action_cond=action_cond)
 
     @torch.no_grad()

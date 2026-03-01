@@ -86,6 +86,12 @@ class PolicyServerConfig:
         metadata={"help": "Seconds between checks for new weights in weights_watch_dir."},
     )
 
+    # Mixed-precision inference: "fp16", "bf16", or None (disabled).
+    mixed_precision: str | None = field(
+        default=None,
+        metadata={"help": "Enable mixed-precision inference: 'fp16', 'bf16', or None (disabled)."},
+    )
+
     def __post_init__(self):
         """Validate configuration after initialization."""
         if self.port < 1 or self.port > 65535:
@@ -99,6 +105,9 @@ class PolicyServerConfig:
 
         if self.obs_queue_timeout < 0:
             raise ValueError(f"obs_queue_timeout must be non-negative, got {self.obs_queue_timeout}")
+
+        if self.mixed_precision not in (None, "fp16", "bf16"):
+            raise ValueError(f"mixed_precision must be 'fp16', 'bf16', or None, got {self.mixed_precision!r}")
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> "PolicyServerConfig":

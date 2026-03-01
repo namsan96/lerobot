@@ -533,6 +533,7 @@ class RobotClient:
                 if self.events["rerecord_episode"]:
                     self.logger.info("Left arrow: discarding episode buffer, will rerecord")
                     self.dataset.clear_episode_buffer()
+                    self._wait_for_enter("Enter to start next episode")
                 else:
                     terminated = self._prompt_terminated()
                     self.dataset.episode_buffer["terminated"][-1] = np.array([terminated], dtype=np.float32)

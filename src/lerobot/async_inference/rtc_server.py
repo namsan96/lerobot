@@ -132,6 +132,11 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             postprocessor_overrides={"device_processor": device_override},
         )
 
+        # Mixed-precision inference setup (no GradScaler needed — inference only)
+        mp = config.mixed_precision
+        _dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(mp, torch.float16)
+        self._autocast_kwargs = dict(device_type=config.device.split(":")[0], dtype=_dtype, enabled=mp is not None)
+
         if config.weights_watch_dir is not None:
             self._start_weights_watcher()
 
@@ -365,7 +370,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         if self.commit_steps is not None and self.last_action_chunk is not None:
             kwargs["action_cond"] = self.last_action_chunk[:, self.commit_steps:, :]
 
-        with self._policy_lock:
+        with self._policy_lock, torch.amp.autocast(**self._autocast_kwargs):
             chunk = self.policy.predict_action_chunk(batch, full_length=True, **kwargs)
         if chunk.ndim != 3:
             chunk = chunk.unsqueeze(0)  # adding batch dimension, now shape is (B, chunk_size, action_dim)

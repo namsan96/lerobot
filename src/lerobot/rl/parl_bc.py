@@ -61,6 +61,10 @@ class PARLBCConfig(AlgorithmConfig):
     # Freeze image encoder during actor updates
     freeze_image_encoder: bool = False
 
+    # Mixed-precision training: "fp16", "bf16", or None (disabled).
+    # fp16 uses a GradScaler; bf16 does not.
+    mixed_precision: str | None = None
+
     # Debug info: save Q/V trajectories and sampled action chunks every N outer iterations.
     # 0 = disabled.
     debug_info_freq: int = 0
@@ -140,6 +144,18 @@ class PARLBCAlgorithm(Algorithm):
         self.actor_optimizer = torch.optim.Adam(actor_params, lr=self.cfg.actor_lr)
         self.critic_optimizer = torch.optim.Adam(critic_params, lr=self.cfg.critic_lr)
 
+        # Mixed-precision setup
+        mp = self.cfg.mixed_precision
+        if mp not in (None, "fp16", "bf16"):
+            raise ValueError(f"mixed_precision must be 'fp16', 'bf16', or None, got {mp!r}")
+        _dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(mp, torch.float16)
+        _device_type = next(policy.parameters()).device.type
+        # autocast: enabled=False is a no-op; dtype is ignored when disabled
+        self._autocast_kwargs = dict(device_type=_device_type, dtype=_dtype, enabled=mp is not None)
+        # GradScaler: enabled=False makes all ops (scale/unscale/step/update) no-ops
+        # bf16 is numerically stable and does not need loss scaling
+        self._scaler = torch.amp.GradScaler(_device_type, enabled=(mp == "fp16"))
+
         # Data iterator — persists across update() calls; reset when loader changes
         self._current_loader: DataLoader | None = None
         self._data_iter = None
@@ -165,7 +181,16 @@ class PARLBCAlgorithm(Algorithm):
             self._data_iter = iter(loader)
             batch = next(self._data_iter)
         if self.preprocessor is not None:
+            # The preprocessor pipeline (batch_to_transition → processors → transition_to_batch)
+            # only preserves obs.*, action, and next.reward/done/truncated.  Keys like "reward",
+            # "terminated", and "next.observation.*" are silently dropped.  Save them first and
+            # restore after preprocessing (moved to device).
+            original = dict(batch)
             batch = self.preprocessor(batch)
+            device = next(self.policy.parameters()).device
+            for k, v in original.items():
+                if k not in batch:
+                    batch[k] = v.to(device) if isinstance(v, torch.Tensor) else v
         else:
             device = next(self.policy.parameters()).device
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
@@ -206,7 +231,8 @@ class PARLBCAlgorithm(Algorithm):
 
         # 3. Actor phase (after critic warmup, every policy_update_period iterations)
         if itr >= self.cfg.n_critic_warmup_itr and itr % self.cfg.policy_update_period == 0:
-            for _ in range(self.cfg.n_batch_per_itr):
+            for step in range(self.cfg.n_batch_per_itr):
+                print(f'Policy step {step}')
                 batch = self._next_batch(loader)
                 info = self._actor_update(batch)
                 itr_info.update(info)
@@ -227,16 +253,19 @@ class PARLBCAlgorithm(Algorithm):
     # ------------------------------------------------------------------
 
     def _critic_update(self, batch: dict) -> dict:
-        q_loss, v_loss, stats = self.policy.critic_loss(batch)
-        critic_loss = q_loss + v_loss
-
         self.critic_optimizer.zero_grad()
-        critic_loss.backward()
+        with torch.amp.autocast(**self._autocast_kwargs):
+            q_loss, v_loss, stats = self.policy.critic_loss(batch)
+            critic_loss = q_loss + v_loss
+
+        self._scaler.scale(critic_loss).backward()
+        self._scaler.unscale_(self.critic_optimizer)
         torch.nn.utils.clip_grad_norm_(
             list(self.policy.critic_q.parameters()) + list(self.policy.critic_v.parameters()),
             self.cfg.grad_clip_norm,
         )
-        self.critic_optimizer.step()
+        self._scaler.step(self.critic_optimizer)
+        self._scaler.update()
 
         return stats
 
@@ -245,17 +274,20 @@ class PARLBCAlgorithm(Algorithm):
     # ------------------------------------------------------------------
 
     def _actor_update(self, batch: dict) -> dict:
-        actor_loss, stats = self.policy.actor_loss(
-            batch, self.ft_diffusion,
-            pretrained_unet=self.policy.pretrained_unet,
-            num_ft_train_steps=self.cfg.num_ft_train_steps,
-        )
-
         self.actor_optimizer.zero_grad()
-        actor_loss.backward()
+        with torch.amp.autocast(**self._autocast_kwargs):
+            actor_loss, stats = self.policy.actor_loss(
+                batch, self.ft_diffusion,
+                pretrained_unet=self.policy.pretrained_unet,
+                num_ft_train_steps=self.cfg.num_ft_train_steps,
+            )
+
+        self._scaler.scale(actor_loss).backward()
+        self._scaler.unscale_(self.actor_optimizer)
         actor_params = [p for p in self.policy.diffusion.parameters() if p.requires_grad]
         torch.nn.utils.clip_grad_norm_(actor_params, self.cfg.grad_clip_norm)
-        self.actor_optimizer.step()
+        self._scaler.step(self.actor_optimizer)
+        self._scaler.update()
 
         return stats
 

@@ -230,18 +230,6 @@ def train(
         pretrained_path=cfg.pretrained_name_or_path,
         preprocessor_overrides={
             "device_processor": {"device": device.type},
-            "normalizer_processor": {
-                "stats": dataset.meta.stats,
-                "features": {**policy.config.input_features, **policy.config.output_features},
-                "norm_map": policy.config.normalization_mapping,
-            },
-        },
-        postprocessor_overrides={
-            "unnormalizer_processor": {
-                "stats": dataset.meta.stats,
-                "features": policy.config.output_features,
-                "norm_map": policy.config.normalization_mapping,
-            },
         },
     )
     algorithm.preprocessor = preprocessor
