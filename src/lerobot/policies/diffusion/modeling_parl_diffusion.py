@@ -59,6 +59,7 @@ class PARLDiffusionConfig(DiffusionConfig):
     expectile: float = 0.5          # asymmetric weight for V expectile regression
     gamma: float = 0.99             # discount factor for TD backup
     tau: float = 0.005              # EMA rate for target Q network
+    q_target_clip_min: float = float("-inf")  # lower-clamp on Q target; -inf = no-op
 
     # Q Transformer architecture (independent of policy DiT config)
     q_hidden_dim: int = 128
@@ -515,7 +516,7 @@ class PARLDiffusionPolicy(DiffusionPolicy):
             next_v_feat = torch.cat([next_state_flat, next_cls_flat], dim=-1)
             next_v = self.critic_v(next_v_feat)                                # (B,)
         gamma_H = pcfg.gamma ** self._horizon
-        q_target = reward + gamma_H * (1.0 - terminated) * next_v
+        q_target = (reward + gamma_H * (1.0 - terminated) * next_v).clamp(min=pcfg.q_target_clip_min)
 
         q = self.critic_q(encoder_tokens, state_flat, action)                  # (B,)
         q_loss = F.mse_loss(q, q_target.detach())
