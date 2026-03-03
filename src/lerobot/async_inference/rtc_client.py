@@ -254,7 +254,11 @@ class RobotClient:
 
         if self.listener is not None:
             self.listener.stop()
-        
+
+        # Flush stale bytes left in the serial receive buffer by the control loop's last sync_read.
+        # Without this, writeTxRx() in go_to_home() reads garbage instead of the motor's status packet.
+        self.robot.bus.port_handler.ser.reset_input_buffer()
+
         self.robot.go_to_home()
 
         self.robot.disconnect()
