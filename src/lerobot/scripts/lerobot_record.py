@@ -164,6 +164,14 @@ class DatasetRecordConfig:
     # Number of episodes to record before batch encoding videos
     # Set to 1 for immediate encoding (default behavior), or higher for batched encoding
     video_encoding_batch_size: int = 1
+    # Number of episodes buffered in memory before flushing metadata to disk.
+    metadata_buffer_size: int = 10
+    # Number of episodes per parquet shard for tabular data. None uses the dataset default.
+    chunks_size: int | None = None
+    # Maximum size in MB for each parquet data file before starting a new one.
+    data_files_size_in_mb: int | None = None
+    # Maximum size in MB for each video file before starting a new one.
+    video_files_size_in_mb: int | None = None
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
 
@@ -422,6 +430,10 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             image_writer_processes=cfg.dataset.num_image_writer_processes,
             image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera * len(robot.cameras),
             batch_encoding_size=cfg.dataset.video_encoding_batch_size,
+            metadata_buffer_size=cfg.dataset.metadata_buffer_size,
+            chunks_size=cfg.dataset.chunks_size,
+            data_files_size_in_mb=cfg.dataset.data_files_size_in_mb,
+            video_files_size_in_mb=cfg.dataset.video_files_size_in_mb,
         )
 
     # Load pretrained policy
