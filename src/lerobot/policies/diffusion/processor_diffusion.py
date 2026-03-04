@@ -18,7 +18,6 @@ from typing import Any
 
 import torch
 
-from lerobot.model.kinematics import RobotKinematics
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.diffusion.joint_to_ee_processor import (
     JointActionToAbsEEStep,
@@ -140,26 +139,15 @@ def make_diffusion_pre_post_processors(
         if config.ee_action_space == "ee_pose_abs":
             input_steps.append(
                 JointActionToAbsEEStep(
-                    kinematics_leader=RobotKinematics(
-                        urdf_path=config.ee_urdf_path,
-                        target_frame_name="gripper_frame_link",
-                        joint_names=motor_names,
-                    ),
+                    urdf_path=config.ee_urdf_path,
+                    motor_names=motor_names,
                 )
             )
         elif config.ee_action_space == "ee_pose_delta":
             input_steps.append(
                 JointActionToDeltaEEStep(
-                    kinematics_leader=RobotKinematics(
-                        urdf_path=config.ee_urdf_path,
-                        target_frame_name="gripper_frame_link",
-                        joint_names=motor_names,
-                    ),
-                    kinematics_follower=RobotKinematics(
-                        urdf_path=config.ee_urdf_path,
-                        target_frame_name="gripper_frame_link",
-                        joint_names=motor_names,
-                    ),
+                    urdf_path=config.ee_urdf_path,
+                    motor_names=motor_names,
                 )
             )
         else:

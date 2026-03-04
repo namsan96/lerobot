@@ -28,7 +28,7 @@ Two modes are supported:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import torch
@@ -81,10 +81,24 @@ class JointActionToAbsEEStep(ProcessorStep):
     (i.e. during inference).
 
     Attributes:
-        kinematics_leader: Kinematics solver for the leader (teleoperator) robot.
+        urdf_path: Path to the robot URDF (serialized to JSON).
+        target_frame_name: End-effector frame name in the URDF.
+        motor_names: Ordered motor names matching action columns.
+        kinematics_leader: Built from the above fields in ``__post_init__``.
     """
 
-    kinematics_leader: RobotKinematics
+    urdf_path: str = ""
+    target_frame_name: str = "gripper_frame_link"
+    motor_names: list[str] = field(default_factory=list)
+    kinematics_leader: RobotKinematics = field(default=None, init=False, repr=False)
+
+    def __post_init__(self):
+        if self.urdf_path:
+            self.kinematics_leader = RobotKinematics(
+                urdf_path=self.urdf_path,
+                target_frame_name=self.target_frame_name,
+                joint_names=self.motor_names or None,
+            )
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         action = transition.get(TransitionKey.ACTION)
@@ -133,12 +147,30 @@ class JointActionToDeltaEEStep(ProcessorStep):
     (i.e. during inference).
 
     Attributes:
-        kinematics_leader:   Kinematics solver for the leader (teleoperator) robot.
-        kinematics_follower: Kinematics solver for the follower robot.
+        urdf_path: Path to the robot URDF (serialized to JSON).
+        target_frame_name: End-effector frame name in the URDF.
+        motor_names: Ordered motor names matching action columns.
+        kinematics_leader/follower: Built from the above fields in ``__post_init__``.
     """
 
-    kinematics_leader: RobotKinematics
-    kinematics_follower: RobotKinematics
+    urdf_path: str = ""
+    target_frame_name: str = "gripper_frame_link"
+    motor_names: list[str] = field(default_factory=list)
+    kinematics_leader: RobotKinematics = field(default=None, init=False, repr=False)
+    kinematics_follower: RobotKinematics = field(default=None, init=False, repr=False)
+
+    def __post_init__(self):
+        if self.urdf_path:
+            self.kinematics_leader = RobotKinematics(
+                urdf_path=self.urdf_path,
+                target_frame_name=self.target_frame_name,
+                joint_names=self.motor_names or None,
+            )
+            self.kinematics_follower = RobotKinematics(
+                urdf_path=self.urdf_path,
+                target_frame_name=self.target_frame_name,
+                joint_names=self.motor_names or None,
+            )
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         action = transition.get(TransitionKey.ACTION)
