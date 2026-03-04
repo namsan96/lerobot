@@ -74,15 +74,22 @@ class EagleBackbone(nn.Module):
         assert not reproject_vision, "Reproject vision is not implemented here, set to False"
 
         # Prefer loading Eagle model config from the cache directory where vendor files were copied.
+        import filelock
+
         vendor_dir = DEFAULT_VENDOR_EAGLE_PATH
         cache_dir = HF_LEROBOT_HOME / tokenizer_assets_repo
-        try:
-            ensure_eagle_cache_ready(vendor_dir, cache_dir, tokenizer_assets_repo)
-        except Exception as exc:  # nosec: B110
-            print(f"[GROOT] Warning: failed to prepare Eagle cache for backbone: {exc}")
+        # Use a file lock to prevent race conditions when multiple GPU processes simultaneously
+        # populate the transformers dynamic-module cache and import the Eagle modeling file.
+        cache_dir.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = str(cache_dir.parent / f"{cache_dir.name}.lock")
+        with filelock.FileLock(lock_path):
+            try:
+                ensure_eagle_cache_ready(vendor_dir, cache_dir, tokenizer_assets_repo)
+            except Exception as exc:  # nosec: B110
+                print(f"[GROOT] Warning: failed to prepare Eagle cache for backbone: {exc}")
 
-        config = AutoConfig.from_pretrained(str(cache_dir), trust_remote_code=True)
-        self.eagle_model = AutoModel.from_config(config, trust_remote_code=True)
+            config = AutoConfig.from_pretrained(str(cache_dir), trust_remote_code=True)
+            self.eagle_model = AutoModel.from_config(config, trust_remote_code=True)
 
         if project_to_dim is not None:
             self.eagle_linear = torch.nn.Linear(2048, project_to_dim)

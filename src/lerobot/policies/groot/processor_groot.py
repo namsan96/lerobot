@@ -183,7 +183,12 @@ def make_groot_pre_post_processors(
 
 
 def _to_uint8_np_bhwc(img_t: torch.Tensor) -> np.ndarray:
-    # img_t: (B, C, H, W) float in [0,1] or uint8
+    # img_t: (B, C, H, W) or (B, T, C, H, W) float in [0,1] or uint8
+    # GR00T only supports T=1; squeeze the time dim if present.
+    if img_t.dim() == 5:
+        if img_t.shape[1] != 1:
+            raise ValueError(f"GR00T only supports T=1 obs steps for images, got T={img_t.shape[1]}")
+        img_t = img_t[:, 0]  # (B, 1, C, H, W) -> (B, C, H, W)
     if img_t.dtype.is_floating_point:
         img_t = (img_t.clamp(0, 1) * 255.0).to(torch.uint8)
     return rearrange(img_t.cpu().numpy(), "b c h w -> b h w c")
