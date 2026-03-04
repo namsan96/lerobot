@@ -569,6 +569,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         episodes: list[int] | None = None,
         image_transforms: Callable | None = None,
         delta_timestamps: dict[str, list[float]] | None = None,
+        feature_aliases: dict[str, str] | None = None,
         tolerance_s: float = 1e-4,
         revision: str | None = None,
         force_cache_sync: bool = False,
@@ -700,6 +701,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.root = Path(root) if root else HF_LEROBOT_HOME / repo_id
         self.image_transforms = image_transforms
         self.delta_timestamps = delta_timestamps
+        self.feature_aliases = feature_aliases or {}
         self.episodes = episodes
         self.tolerance_s = tolerance_s
         self.revision = revision if revision else CODEBASE_VERSION
@@ -1012,6 +1014,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
     def _query_hf_dataset(self, query_indices: dict[str, list[int]]) -> dict:
         def _src(key: str) -> str:
+            # Explicit alias wins (e.g. "aux.curr_state" → "observation.state").
+            if key in self.feature_aliases:
+                return self.feature_aliases[key]
             # Allow "next.<feature>" as an alias for "<feature>" fetched at a future delta.
             # The output dict key stays "next.<feature>"; only the hf_dataset lookup is remapped.
             if key.startswith("next.") and key not in self.hf_dataset.features:

@@ -116,10 +116,29 @@ def resolve_delta_timestamps(
         if key.startswith(OBS_PREFIX) and cfg.observation_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.observation_delta_indices]
 
+    # Auxiliary keys: policy declares extra data it needs loaded at specific timesteps.
+    # Format: {output_batch_key: (source_dataset_feature, delta_indices)}
+    aux = getattr(cfg, "auxiliary_delta_indices", None)
+    if aux:
+        for out_key, (src_key, indices) in aux.items():
+            if src_key in ds_meta.features:
+                delta_timestamps[out_key] = [i / ds_meta.fps for i in indices]
+
     if len(delta_timestamps) == 0:
         delta_timestamps = None
 
     return delta_timestamps
+
+
+def resolve_feature_aliases(cfg: PreTrainedConfig) -> dict[str, str]:
+    """Build a feature_aliases dict from cfg.auxiliary_delta_indices.
+
+    Returns a mapping {output_batch_key: source_dataset_feature} for use with LeRobotDataset.
+    """
+    aux = getattr(cfg, "auxiliary_delta_indices", None)
+    if not aux:
+        return {}
+    return {out_key: src_key for out_key, (src_key, _) in aux.items()}
 
 
 def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDataset:
@@ -143,12 +162,14 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
         )
         delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
+        feature_aliases = resolve_feature_aliases(cfg.policy)
         if not cfg.dataset.streaming:
             dataset = LeRobotDataset(
                 cfg.dataset.repo_id,
                 root=cfg.dataset.root,
                 episodes=cfg.dataset.episodes,
                 delta_timestamps=delta_timestamps,
+                feature_aliases=feature_aliases or None,
                 image_transforms=image_transforms,
                 revision=cfg.dataset.revision,
                 video_backend=cfg.dataset.video_backend,

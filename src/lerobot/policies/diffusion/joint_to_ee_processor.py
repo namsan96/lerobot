@@ -1,0 +1,197 @@
+#!/usr/bin/env python
+
+# Copyright 2025 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Batch-level preprocessor steps that convert joint-space actions to EE-space actions on the fly.
+
+These steps are inserted into the diffusion policy preprocessor pipeline *before* normalization.
+They are no-ops at inference time because `select_action` removes the `action` key from the batch
+before calling the preprocessor, so the step simply passes the transition through unchanged.
+
+Two modes are supported:
+  - ``ee_pose_abs``:  action[t] = FK(teleop_joints[t])  → (x, y, z, wx, wy, wz, gripper_pos)
+  - ``ee_pose_delta``: action[t] = relative SE(3) from current follower EE to leader EE goal
+                       → (delta_x, delta_y, delta_z, delta_wx, delta_wy, delta_wz, gripper_pos)
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+import torch
+
+from lerobot.configs.types import PipelineFeatureType, PolicyFeature
+from lerobot.model.kinematics import RobotKinematics
+from lerobot.processor import EnvTransition, TransitionKey
+from lerobot.processor.pipeline import ProcessorStep
+from lerobot.utils.rotation import Rotation
+
+
+def _batched_fk(
+    kinematics: RobotKinematics,
+    joints: np.ndarray,
+) -> np.ndarray:
+    """Apply FK to a (N, D) array of joint positions (degrees).
+
+    Returns an (N, 4, 4) array of SE(3) transformation matrices.
+    """
+    n = joints.shape[0]
+    transforms = np.empty((n, 4, 4), dtype=np.float64)
+    for i in range(n):
+        transforms[i] = kinematics.forward_kinematics(joints[i])
+    return transforms
+
+
+def _se3_to_ee_tensor(transforms: np.ndarray, gripper: np.ndarray) -> np.ndarray:
+    """Convert (N, 4, 4) SE(3) matrices + (N,) gripper values to (N, 7) EE array.
+
+    Layout: [x, y, z, wx, wy, wz, gripper_pos]
+    """
+    n = transforms.shape[0]
+    ee = np.empty((n, 7), dtype=np.float32)
+    for i in range(n):
+        T = transforms[i]
+        ee[i, :3] = T[:3, 3]
+        ee[i, 3:6] = Rotation.from_matrix(T[:3, :3]).as_rotvec()
+    ee[:, 6] = gripper
+    return ee
+
+
+@dataclass
+class JointActionToAbsEEStep(ProcessorStep):
+    """Replace joint-space action with absolute EE pose via FK.
+
+    For each action step, computes FK(teleop_joints) and outputs
+    ``(x, y, z, wx, wy, wz, gripper_pos)`` — a 7-dimensional EE pose.
+
+    This step is a no-op when ``action`` is not present in the transition
+    (i.e. during inference).
+
+    Attributes:
+        kinematics_leader: Kinematics solver for the leader (teleoperator) robot.
+    """
+
+    kinematics_leader: RobotKinematics
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        action = transition.get(TransitionKey.ACTION)
+        if action is None:
+            return transition  # inference path — no action in batch
+
+        # action: (B, horizon, D) tensor of joint positions in degrees
+        device = action.device
+        dtype = action.dtype
+        B, H, D = action.shape
+        joints_np = action.detach().cpu().numpy().reshape(B * H, D)
+
+        # Gripper is the last column; pass through unchanged
+        gripper_np = joints_np[:, -1]
+
+        transforms = _batched_fk(self.kinematics_leader, joints_np)  # (B*H, 4, 4)
+        ee_np = _se3_to_ee_tensor(transforms, gripper_np)  # (B*H, 7)
+        ee_tensor = torch.from_numpy(ee_np).to(device=device, dtype=dtype).reshape(B, H, 7)
+
+        new_transition = transition.copy()
+        new_transition[TransitionKey.ACTION] = ee_tensor
+        return new_transition
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
+
+
+@dataclass
+class JointActionToDeltaEEStep(ProcessorStep):
+    """Replace joint-space action with per-step delta EE pose.
+
+    For each action step at horizon index t, computes:
+        T_ref  = FK(follower_joints[t])   — from ``aux.curr_state[:, t, :]``
+        T_goal = FK(teleop_joints[t])
+        delta_pos    = T_goal[:3, 3] - T_ref[:3, 3]
+        delta_rotvec = Rotation(T_ref[:3,:3].T @ T_goal[:3,:3]).as_rotvec()
+
+    ``aux.curr_state`` must be present in the batch — it is loaded by the dataset at the same
+    delta indices as the action sequence via ``DiffusionConfig.auxiliary_delta_indices``.
+
+    Output per step: ``(delta_x, delta_y, delta_z, delta_wx, delta_wy, delta_wz, gripper_pos)``
+
+    This step is a no-op when ``action`` is not present in the transition
+    (i.e. during inference).
+
+    Attributes:
+        kinematics_leader:   Kinematics solver for the leader (teleoperator) robot.
+        kinematics_follower: Kinematics solver for the follower robot.
+    """
+
+    kinematics_leader: RobotKinematics
+    kinematics_follower: RobotKinematics
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        action = transition.get(TransitionKey.ACTION)
+        if action is None:
+            return transition  # inference path — no action in batch
+
+        observation = transition.get(TransitionKey.OBSERVATION)
+        if observation is None:
+            raise ValueError(
+                "JointActionToDeltaEEStep requires 'observation' in the transition."
+            )
+
+        # aux.curr_state: (B, H, state_dim) — follower joints co-recorded at each action timestep
+        curr_state = observation.get("aux.curr_state")
+        if curr_state is None:
+            raise ValueError(
+                "JointActionToDeltaEEStep requires 'aux.curr_state' in the batch. "
+                "Ensure DiffusionConfig.auxiliary_delta_indices is set (ee_action_space='ee_pose_delta') "
+                "and the dataset is built with resolve_feature_aliases."
+            )
+
+        device = action.device
+        dtype = action.dtype
+        B, H, D = action.shape
+
+        # Per-step follower joints: (B*H, state_dim)
+        follower_joints_np = curr_state.detach().cpu().numpy().reshape(B * H, -1)
+
+        # Per-step reference EE poses: (B*H, 4, 4)
+        T_ref = _batched_fk(self.kinematics_follower, follower_joints_np)
+
+        # Goal EE poses: (B*H, 4, 4)
+        leader_joints_np = action.detach().cpu().numpy().reshape(B * H, D)
+        gripper_np = leader_joints_np[:, -1]  # (B*H,)
+        T_goals = _batched_fk(self.kinematics_leader, leader_joints_np)
+
+        # delta_pos and delta_R are now per-step (no fixed-reference expansion needed)
+        delta_pos = T_goals[:, :3, 3] - T_ref[:, :3, 3]  # (B*H, 3)
+        delta_R = T_ref[:, :3, :3].transpose(0, 2, 1) @ T_goals[:, :3, :3]  # (B*H, 3, 3)
+        delta_rotvec = np.stack(
+            [Rotation.from_matrix(delta_R[i]).as_rotvec() for i in range(B * H)], axis=0
+        )  # (B*H, 3)
+
+        ee_np = np.concatenate([delta_pos, delta_rotvec, gripper_np[:, None]], axis=-1).astype(
+            np.float32
+        )  # (B*H, 7)
+        ee_tensor = torch.from_numpy(ee_np).to(device=device, dtype=dtype).reshape(B, H, 7)
+
+        new_transition = transition.copy()
+        new_transition[TransitionKey.ACTION] = ee_tensor
+        return new_transition
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features

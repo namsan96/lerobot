@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
+import torch
 
 from lerobot.configs.types import FeatureType, PipelineFeatureType, PolicyFeature
 from lerobot.model.kinematics import RobotKinematics
@@ -30,7 +31,37 @@ from lerobot.processor import (
     RobotActionProcessorStep,
     TransitionKey,
 )
+from lerobot.processor.converters import create_transition, transition_to_robot_action
+from lerobot.processor.factory import make_default_robot_action_processor
+from lerobot.processor.pipeline import RobotProcessorPipeline
 from lerobot.utils.rotation import Rotation
+
+# EE action key order — must match the 7D tensor produced by the diffusion policy
+# when trained with ee_pose_abs or ee_pose_delta action space.
+EE_ACTION_NAMES = ["ee.x", "ee.y", "ee.z", "ee.wx", "ee.wy", "ee.wz", "ee.gripper_pos"]
+
+
+def ee_tensor_obs_to_transition(
+    action_observation: tuple[torch.Tensor, dict],
+) -> EnvTransition:
+    """Convert a (tensor, obs_dict) pair into an EnvTransition with ee.* action keys.
+
+    Use this as the ``to_transition`` argument when building a ``RobotProcessorPipeline``
+    for EE action spaces (``ee_pose_abs`` or ``ee_pose_delta``).  It replaces the default
+    converter, which requires a pre-built dict and would reject a raw tensor.
+
+    Args:
+        action_observation: Tuple of (action_tensor, observation_dict).
+            ``action_tensor`` is a 1-D tensor of length 7 with layout
+            ``[x, y, z, wx, wy, wz, gripper_pos]``.
+
+    Returns:
+        An ``EnvTransition`` with the action stored as a ``ee.*`` dict and the
+        observation stored under ``TransitionKey.OBSERVATION``.
+    """
+    tensor, obs = action_observation
+    ee_dict = {name: float(tensor[i]) for i, name in enumerate(EE_ACTION_NAMES)}
+    return create_transition(action=ee_dict, observation=obs)
 
 
 @ProcessorStepRegistry.register("ee_reference_and_delta")
@@ -337,6 +368,83 @@ class InverseKinematicsEEToJoints(RobotActionProcessorStep):
         self.q_curr = None
 
 
+@ProcessorStepRegistry.register("delta_ee_to_absolute_ee")
+@dataclass
+class DeltaEEToAbsoluteEEStep(RobotActionProcessorStep):
+    """
+    Converts a delta end-effector action into an absolute EE target pose.
+
+    Used at inference time when the policy was trained with ``ee_pose_delta`` action space.
+    It reads the current follower joint positions from the observation, applies FK to obtain
+    the current EE pose (T_ref), then composes it with the policy's delta output to produce
+    an absolute EE target for the downstream ``InverseKinematicsEEToJoints`` step.
+
+    The caller (inference script) is responsible for mapping the policy output tensor to a
+    dict with ``ee.*`` keys before passing it to this processor.  Example:
+        ee_names = ["ee.x", "ee.y", "ee.z", "ee.wx", "ee.wy", "ee.wz", "ee.gripper_pos"]
+        ee_dict = {name: float(action_tensor[i]) for i, name in enumerate(ee_names)}
+        robot_action = robot_action_processor((ee_dict, obs))
+
+    Input action keys (delta values):
+        ee.x, ee.y, ee.z       — position delta in meters
+        ee.wx, ee.wy, ee.wz    — rotation delta as rotation vector (radians)
+        ee.gripper_pos         — gripper position, passed through unchanged
+
+    Output action keys (absolute values, same names overwritten):
+        ee.x, ee.y, ee.z       — absolute EE position
+        ee.wx, ee.wy, ee.wz    — absolute EE orientation as rotation vector
+        ee.gripper_pos         — unchanged
+
+    Attributes:
+        kinematics:           FK solver for the follower robot.
+        follower_motor_names: Motor names in the same order as observation joint positions.
+    """
+
+    kinematics: RobotKinematics
+    follower_motor_names: list[str]
+
+    def action(self, action: RobotAction) -> RobotAction:
+        obs = self.transition.get(TransitionKey.OBSERVATION)
+        if obs is None:
+            raise ValueError("DeltaEEToAbsoluteEEStep requires an observation in the transition.")
+
+        # Build current joint array (arm joints only, skip gripper for FK)
+        current_joints = np.array(
+            [float(obs[f"{name}.pos"]) for name in self.follower_motor_names if name != "gripper"],
+            dtype=float,
+        )
+
+        # FK: current follower EE pose
+        T_ref = self.kinematics.forward_kinematics(current_joints)
+
+        # Read delta EE from action
+        delta_pos = np.array([action["ee.x"], action["ee.y"], action["ee.z"]], dtype=float)
+        delta_R = Rotation.from_rotvec([action["ee.wx"], action["ee.wy"], action["ee.wz"]]).as_matrix()
+
+        # Compose: T_goal = T_ref ⊕ delta_T  (delta expressed in world frame)
+        T_goal = np.eye(4, dtype=float)
+        T_goal[:3, :3] = T_ref[:3, :3] @ delta_R
+        T_goal[:3, 3] = T_ref[:3, 3] + delta_pos
+
+        abs_pos = T_goal[:3, 3]
+        abs_rotvec = Rotation.from_matrix(T_goal[:3, :3]).as_rotvec()
+
+        action["ee.x"] = float(abs_pos[0])
+        action["ee.y"] = float(abs_pos[1])
+        action["ee.z"] = float(abs_pos[2])
+        action["ee.wx"] = float(abs_rotvec[0])
+        action["ee.wy"] = float(abs_rotvec[1])
+        action["ee.wz"] = float(abs_rotvec[2])
+        # ee.gripper_pos passes through unchanged
+        return action
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        # Key names are unchanged (ee.* stays ee.*); only semantics change delta → absolute.
+        return features
+
+
 @ProcessorStepRegistry.register("gripper_velocity_to_joint")
 @dataclass
 class GripperVelocityToJoint(RobotActionProcessorStep):
@@ -517,6 +625,65 @@ class ForwardKinematicsJointsToEE(ProcessorStep):
         if features[PipelineFeatureType.OBSERVATION] is not None:
             features = self.joints_to_ee_observation_processor.transform_features(features)
         return features
+
+
+def make_policy_robot_action_processor(
+    ee_action_space: str,
+    motor_names: list[str],
+    ee_urdf_path: str | None = None,
+    end_effector_bounds: dict | None = None,
+) -> RobotProcessorPipeline:
+    """Build a robot_action_processor pipeline that converts policy output to joint commands.
+
+    Args:
+        ee_action_space: One of "joint_pos", "ee_pose_abs", "ee_pose_delta".
+        motor_names: Ordered list of motor names (including gripper).
+        ee_urdf_path: Path to the robot URDF.  Required when ee_action_space != "joint_pos".
+        end_effector_bounds: Optional dict with "min"/"max" numpy arrays (3D position bounds)
+            passed to EEBoundsAndSafety.  Defaults to conservative workspace bounds if None.
+
+    Returns:
+        A RobotProcessorPipeline whose input type matches the action space:
+          - joint_pos: (RobotAction dict, RobotObservation) → joint dict  (identity)
+          - ee_pose_abs / ee_pose_delta: (action tensor, RobotObservation) → joint dict
+    """
+    if ee_action_space == "joint_pos":
+        return make_default_robot_action_processor()
+
+    if ee_urdf_path is None:
+        raise ValueError("ee_urdf_path must be set when ee_action_space != 'joint_pos'")
+
+    arm_names = [n for n in motor_names if n != "gripper"]
+    kinematics = RobotKinematics(urdf_path=ee_urdf_path, joint_names=arm_names)
+
+    if end_effector_bounds is None:
+        end_effector_bounds = {
+            "min": np.array([-0.5, -0.5, 0.0]),
+            "max": np.array([0.5, 0.5, 0.8]),
+        }
+
+    steps = []
+    if ee_action_space == "ee_pose_delta":
+        steps.append(DeltaEEToAbsoluteEEStep(
+            kinematics=kinematics,
+            follower_motor_names=motor_names,
+        ))
+    elif ee_action_space != "ee_pose_abs":
+        raise ValueError(
+            f"Unknown ee_action_space '{ee_action_space}'. "
+            "Choose from 'joint_pos', 'ee_pose_abs', 'ee_pose_delta'."
+        )
+
+    steps.extend([
+        EEBoundsAndSafety(end_effector_bounds=end_effector_bounds),
+        InverseKinematicsEEToJoints(kinematics=kinematics, motor_names=motor_names),
+    ])
+
+    return RobotProcessorPipeline(
+        steps=steps,
+        to_transition=ee_tensor_obs_to_transition,
+        to_output=transition_to_robot_action,
+    )
 
 
 @ProcessorStepRegistry.register("inverse_kinematics_rl_step")

@@ -18,7 +18,12 @@ from typing import Any
 
 import torch
 
+from lerobot.model.kinematics import RobotKinematics
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
+from lerobot.policies.diffusion.joint_to_ee_processor import (
+    JointActionToAbsEEStep,
+    JointActionToDeltaEEStep,
+)
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
@@ -30,6 +35,58 @@ from lerobot.processor import (
 )
 from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
+
+# Hardcoded motor names per robot type (order must match the action tensor column order).
+_MOTOR_NAMES: dict[str, list[str]] = {
+    "so101": [
+        "shoulder_pan",
+        "shoulder_lift",
+        "elbow_flex",
+        "wrist_flex",
+        "wrist_roll",
+        "gripper",
+    ],
+}
+
+
+def _get_motor_names(robot_type: str) -> list[str]:
+    if robot_type not in _MOTOR_NAMES:
+        raise NotImplementedError(
+            f"EE action space only supports robot types {list(_MOTOR_NAMES)}, got '{robot_type}'. "
+            "Add your robot's motor names to _MOTOR_NAMES in processor_diffusion.py."
+        )
+    return _MOTOR_NAMES[robot_type]
+
+
+def _build_ee_action_stats(
+    config: DiffusionConfig,
+    dataset_stats: dict[str, dict[str, torch.Tensor]] | None,
+) -> dict[str, dict[str, torch.Tensor]]:
+    """Build a 7D action stats dict by combining 6D EE bounds + gripper from dataset stats."""
+    ee_cfg = config.ee_action_stats
+    if ee_cfg is None:
+        raise ValueError(
+            "ee_action_stats must be set when ee_action_space != 'joint_pos'. "
+            "Provide 6D bounds (no gripper) as {'action': {'min': [...], 'max': [...]}}."
+        )
+
+    ee_min = torch.as_tensor(ee_cfg["action"]["min"], dtype=torch.float32)  # (6,)
+    ee_max = torch.as_tensor(ee_cfg["action"]["max"], dtype=torch.float32)  # (6,)
+
+    # Gripper stats from original dataset (last dim of the original joint action)
+    if dataset_stats is not None and "action" in dataset_stats:
+        gripper_min = torch.as_tensor(dataset_stats["action"]["min"][-1:], dtype=torch.float32)
+        gripper_max = torch.as_tensor(dataset_stats["action"]["max"][-1:], dtype=torch.float32)
+    else:
+        gripper_min = torch.tensor([0.0])
+        gripper_max = torch.tensor([100.0])
+
+    combined_stats: dict[str, dict[str, torch.Tensor]] = dict(dataset_stats) if dataset_stats else {}
+    combined_stats["action"] = {
+        "min": torch.cat([ee_min, gripper_min]),   # (7,)
+        "max": torch.cat([ee_max, gripper_max]),   # (7,)
+    }
+    return combined_stats
 
 
 def make_diffusion_pre_post_processors(
@@ -43,10 +100,11 @@ def make_diffusion_pre_post_processors(
     Constructs pre-processor and post-processor pipelines for a diffusion policy.
 
     The pre-processing pipeline prepares the input data for the model by:
-    1. Renaming features.
-    2. Normalizing the input and output features based on dataset statistics.
-    3. Adding a batch dimension.
-    4. Moving the data to the specified device.
+    1. Optionally transforming joint-space actions to EE-space (ee_pose_abs / ee_pose_delta).
+    2. Renaming features.
+    3. Normalizing the input and output features based on dataset statistics.
+    4. Adding a batch dimension.
+    5. Moving the data to the specified device.
 
     The post-processing pipeline handles the model's output by:
     1. Moving the data to the CPU.
@@ -62,19 +120,67 @@ def make_diffusion_pre_post_processors(
         A tuple containing the configured pre-processor and post-processor pipelines.
     """
 
-    input_steps = [
+    # Resolve effective normalization stats (may be overridden for EE action spaces).
+    if config.ee_action_space != "joint_pos":
+        effective_stats = _build_ee_action_stats(config, dataset_stats)
+    else:
+        effective_stats = dataset_stats
+
+    input_steps: list = [
         RenameObservationsProcessorStep(rename_map={}),
         AddBatchDimensionProcessorStep(),
         DeviceProcessorStep(device=config.device),
+    ]
+
+    if config.ee_action_space != "joint_pos":
+        if config.ee_urdf_path is None:
+            raise ValueError("ee_urdf_path must be set when ee_action_space != 'joint_pos'.")
+        motor_names = _get_motor_names(config.ee_robot_type)
+
+        if config.ee_action_space == "ee_pose_abs":
+            input_steps.append(
+                JointActionToAbsEEStep(
+                    kinematics_leader=RobotKinematics(
+                        urdf_path=config.ee_urdf_path,
+                        target_frame_name="gripper_frame_link",
+                        joint_names=motor_names,
+                    ),
+                )
+            )
+        elif config.ee_action_space == "ee_pose_delta":
+            input_steps.append(
+                JointActionToDeltaEEStep(
+                    kinematics_leader=RobotKinematics(
+                        urdf_path=config.ee_urdf_path,
+                        target_frame_name="gripper_frame_link",
+                        joint_names=motor_names,
+                    ),
+                    kinematics_follower=RobotKinematics(
+                        urdf_path=config.ee_urdf_path,
+                        target_frame_name="gripper_frame_link",
+                        joint_names=motor_names,
+                    ),
+                )
+            )
+        else:
+            raise ValueError(
+                f"Unknown ee_action_space '{config.ee_action_space}'. "
+                "Choose from 'joint_pos', 'ee_pose_abs', 'ee_pose_delta'."
+            )
+
+    input_steps.append(
         NormalizerProcessorStep(
             features={**config.input_features, **config.output_features},
             norm_map=config.normalization_mapping,
-            stats=dataset_stats,
-        ),
-    ]
+            stats=effective_stats,
+        )
+    )
+
     output_steps = [
         UnnormalizerProcessorStep(
-            features=config.output_features, norm_map=config.normalization_mapping, stats=dataset_stats
+            features=config.output_features,
+            norm_map=config.normalization_mapping,
+            stats=effective_stats,
         ),
         DeviceProcessorStep(device="cpu"),
     ]

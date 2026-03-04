@@ -441,9 +441,8 @@ class Eagle25VLImageProcessorFast(BaseImageProcessorFast):
         input_data_format = kwargs.pop("input_data_format")
         device = kwargs.pop("device")
         # Prepare input images
-        # transformers >= 4.53.0: uses _prepare_image_like_inputs instead of _prepare_input_images
         if images is not None:
-            images = self._prepare_image_like_inputs(
+            images = self._prepare_input_images(
                 images=images,
                 do_convert_rgb=do_convert_rgb,
                 input_data_format=input_data_format,
@@ -451,7 +450,7 @@ class Eagle25VLImageProcessorFast(BaseImageProcessorFast):
             )
 
         if videos is not None:
-            videos = self._prepare_image_like_inputs(
+            videos = self._prepare_input_images(
                 images=videos,
                 do_convert_rgb=do_convert_rgb,
                 input_data_format=input_data_format,

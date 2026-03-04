@@ -58,6 +58,7 @@ from lerobot.robots import (  # noqa: F401
     so100_follower,
     so101_follower,
 )
+from lerobot.robots.so100_follower.robot_kinematic_processor import make_policy_robot_action_processor
 from lerobot.transport import (
     services_pb2,  # type: ignore
     services_pb2_grpc,  # type: ignore
@@ -165,6 +166,20 @@ class RobotClient:
         self.listener, self.events = init_keyboard_listener()
 
         self.logger.info("Robot connected and ready")
+
+        # Build the robot action processor based on the configured action space.
+        # For joint_pos: identity pipeline (tensor → dict via action_features, no IK).
+        # For ee_pose_abs / ee_pose_delta: EE pipeline (tensor → ee.* dict → IK → joint dict).
+        if config.ee_action_space != "joint_pos":
+            from lerobot.policies.diffusion.processor_diffusion import _get_motor_names
+            motor_names = _get_motor_names(config.ee_robot_type)
+        else:
+            motor_names = []
+        self.robot_action_processor = make_policy_robot_action_processor(
+            ee_action_space=config.ee_action_space,
+            motor_names=motor_names,
+            ee_urdf_path=config.ee_urdf_path,
+        )
 
         # e.g. downsample = 4 => a3, a7, ...
         # chunk 7 => horizon 1 / chunk 8 => horizon 2
@@ -409,7 +424,12 @@ class RobotClient:
 
     def control_loop_action(self, timed_action, verbose: bool = False) -> dict[str, Any]:
         """Execute action on robot. Returns the action dict sent (pre-clip, like lerobot_record)."""
-        action_dict = self._action_tensor_to_action_dict(timed_action.get_action())
+        action_tensor = timed_action.get_action()
+        if self.config.ee_action_space == "joint_pos":
+            action_dict = self._action_tensor_to_action_dict(action_tensor)
+        else:
+            action_dict = self.robot_action_processor((action_tensor, self.latest_raw_obs))
+
         self.robot.send_action(action_dict)
         if verbose:
             raise NotImplementedError("Not implemented")

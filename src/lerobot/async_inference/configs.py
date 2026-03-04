@@ -188,6 +188,23 @@ class RobotClientConfig:
         default=False, metadata={"help": "If True, resume recording into an existing dataset instead of creating a new one."}
     )
 
+    # EE action space — mirrors DiffusionConfig.ee_action_space.
+    # "joint_pos": policy outputs joint positions directly (default, identity pipeline).
+    # "ee_pose_abs": policy outputs absolute 7D EE pose → IK → joint positions.
+    # "ee_pose_delta": policy outputs delta 7D EE pose → abs EE via FK → IK → joint positions.
+    ee_action_space: str = field(
+        default="joint_pos",
+        metadata={"help": "EE action space mode. One of 'joint_pos', 'ee_pose_abs', 'ee_pose_delta'."},
+    )
+    ee_urdf_path: str | None = field(
+        default=None,
+        metadata={"help": "Path to the robot URDF for FK/IK. Required when ee_action_space != 'joint_pos'."},
+    )
+    ee_robot_type: str = field(
+        default="so101",
+        metadata={"help": "Robot type for looking up motor names. Currently only 'so101' is supported."},
+    )
+
     @property
     def environment_dt(self) -> float:
         """Environment time step, in seconds"""

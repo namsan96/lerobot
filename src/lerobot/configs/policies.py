@@ -111,6 +111,17 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
     def reward_delta_indices(self) -> list | None:  # type: ignore[type-arg]    #TODO: No implementation
         raise NotImplementedError
 
+    @property
+    def auxiliary_delta_indices(self) -> dict[str, list] | None:
+        """Optional extra dataset keys to load at specific delta indices.
+
+        Returns a dict mapping output batch key → list of integer frame offsets, e.g.:
+            {"next.observation.state": [0, 1, ..., H-1]}
+        These entries are added to delta_timestamps by resolve_delta_timestamps.
+        Override in subclasses that need additional data loaded by the dataset.
+        """
+        return None
+
     @abc.abstractmethod
     def get_optimizer_preset(self) -> OptimizerConfig:
         raise NotImplementedError

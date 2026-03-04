@@ -17,7 +17,7 @@
 from dataclasses import dataclass, field
 
 from lerobot.configs.policies import PreTrainedConfig
-from lerobot.configs.types import NormalizationMode
+from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.optim.optimizers import AdamConfig
 from lerobot.optim.schedulers import DiffuserSchedulerConfig
 
@@ -120,6 +120,25 @@ class DiffusionConfig(PreTrainedConfig):
             "ACTION": NormalizationMode.MIN_MAX,
         }
     )
+
+    # EE action space options.
+    # "joint_pos"    : default — no transform, train directly in joint space.
+    # "ee_pose_abs"  : replace action with FK(teleop_joints) → 7D (x,y,z,wx,wy,wz,gripper_pos).
+    #                  At inference, IK converts policy output back to joint positions.
+    # "ee_pose_delta": replace action with 7D delta EE relative to current follower EE.
+    #                  At inference, DeltaEEToAbsoluteEEStep + IK converts to joint positions.
+    ee_action_space: str = "joint_pos"
+    # Robot type used to look up hardcoded motor names.  Currently only "so101" is supported;
+    # any other value will raise a NotImplementedError at pre-processor construction time.
+    ee_robot_type: str = "so101"
+    # Path to the robot URDF for FK/IK.  Required when ee_action_space != "joint_pos".
+    ee_urdf_path: str | None = None
+    # Normalization bounds for the 6D EE pose part of the action (raw EE units, before normalization).
+    # The normalizer maps these to [-1, 1] via MIN_MAX.  Gripper dim is excluded here; it is
+    # automatically appended from the original dataset stats (gripper range stays 0–100 as recorded).
+    # Layout: [x/dx, y/dy, z/dz, wx/dwx, wy/dwy, wz/dwz]  (6 values, no gripper).
+    # If None, dataset stats are used as-is (only appropriate for joint_pos mode).
+    ee_action_stats: dict | None = None
 
     # The original implementation doesn't sample frames for the last 7 steps,
     # which avoids excessive padding and leads to improved training results.
@@ -234,6 +253,13 @@ class DiffusionConfig(PreTrainedConfig):
             num_warmup_steps=self.scheduler_warmup_steps,
         )
 
+    @property
+    def action_feature(self) -> PolicyFeature | None:
+        ft = super().action_feature
+        if ft is not None and self.ee_action_space != "joint_pos":
+            return PolicyFeature(type=FeatureType.ACTION, shape=(7,))
+        return ft
+
     def validate_features(self) -> None:
         if len(self.image_features) == 0 and self.env_state_feature is None:
             raise ValueError("You must provide at least one image or the environment state among the inputs.")
@@ -255,6 +281,17 @@ class DiffusionConfig(PreTrainedConfig):
                     raise ValueError(
                         f"`{key}` does not match `{first_image_key}`, but we expect all image shapes to match."
                     )
+
+    @property
+    def auxiliary_delta_indices(self) -> dict | None:
+        """Load co-recorded follower state at action timesteps for ee_pose_delta training.
+
+        The output key ``"aux.curr_state"`` carries follower joints at each action horizon
+        step, allowing JointActionToDeltaEEStep to compute per-step delta EE targets.
+        """
+        if self.ee_action_space == "ee_pose_delta":
+            return {"aux.curr_state": ("observation.state", self.action_delta_indices)}
+        return None
 
     @property
     def observation_delta_indices(self) -> list:
