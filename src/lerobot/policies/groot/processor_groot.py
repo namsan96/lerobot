@@ -35,6 +35,11 @@ from lerobot.configs.types import (
     NormalizationMode,
     PolicyFeature,
 )
+from lerobot.policies.diffusion.joint_to_ee_processor import (
+    JointActionToAbsEEStep,
+    JointActionToDeltaEEStep,
+)
+from lerobot.policies.diffusion.processor_diffusion import _get_motor_names
 from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
@@ -58,6 +63,37 @@ from lerobot.utils.constants import (
 
 # Defaults for Eagle processor locations
 DEFAULT_TOKENIZER_ASSETS_REPO = "lerobot/eagle2hg-processor-groot-n1p5"
+
+
+def _build_ee_action_stats(
+    config: GrootConfig,
+    dataset_stats: dict[str, dict[str, torch.Tensor]] | None,
+) -> dict[str, dict[str, torch.Tensor]]:
+    """Build a 7D action stats dict by combining 6D EE bounds + gripper from dataset stats."""
+    ee_cfg = config.ee_action_stats
+    if ee_cfg is None:
+        raise ValueError(
+            "ee_action_stats must be set when ee_action_space != 'joint_pos'. "
+            "Provide 6D bounds (no gripper) as {'action': {'min': [...], 'max': [...]}}."
+        )
+
+    ee_min = torch.as_tensor(ee_cfg["action"]["min"], dtype=torch.float32)  # (6,)
+    ee_max = torch.as_tensor(ee_cfg["action"]["max"], dtype=torch.float32)  # (6,)
+
+    # Gripper stats from original dataset (last dim of the original joint action)
+    if dataset_stats is not None and "action" in dataset_stats:
+        gripper_min = torch.as_tensor(dataset_stats["action"]["min"][-1:], dtype=torch.float32)
+        gripper_max = torch.as_tensor(dataset_stats["action"]["max"][-1:], dtype=torch.float32)
+    else:
+        gripper_min = torch.tensor([0.0])
+        gripper_max = torch.tensor([100.0])
+
+    combined_stats: dict[str, dict[str, torch.Tensor]] = dict(dataset_stats) if dataset_stats else {}
+    combined_stats["action"] = {
+        "min": torch.cat([ee_min, gripper_min]),  # (7,)
+        "max": torch.cat([ee_max, gripper_max]),  # (7,)
+    }
+    return combined_stats
 
 
 def make_groot_pre_post_processors(
@@ -101,8 +137,11 @@ def make_groot_pre_post_processors(
     max_state_dim = config.max_state_dim
     max_action_dim = config.max_action_dim
 
-    # Pass raw dataset_stats; normalization will occur inside pack step before padding
-    padded_stats = dataset_stats or {}
+    # Resolve effective normalization stats (may be overridden for EE action spaces).
+    if config.ee_action_space != "joint_pos":
+        padded_stats = _build_ee_action_stats(config, dataset_stats)
+    else:
+        padded_stats = dataset_stats or {}
 
     # Define feature specs for optional normalization steps
     _features: dict[str, PolicyFeature] = {
@@ -130,6 +169,34 @@ def make_groot_pre_post_processors(
         RenameObservationsProcessorStep(rename_map={}),
         # 2. Add batch dimension for single samples
         AddBatchDimensionProcessorStep(),
+    ]
+
+    # 2b. Optionally convert joint-space action to EE-space before normalization.
+    if config.ee_action_space != "joint_pos":
+        if config.ee_urdf_path is None:
+            raise ValueError("ee_urdf_path must be set when ee_action_space != 'joint_pos'.")
+        motor_names = _get_motor_names(config.ee_robot_type)
+        if config.ee_action_space == "ee_pose_abs":
+            input_steps.append(
+                JointActionToAbsEEStep(
+                    urdf_path=config.ee_urdf_path,
+                    motor_names=motor_names,
+                )
+            )
+        elif config.ee_action_space == "ee_pose_delta":
+            input_steps.append(
+                JointActionToDeltaEEStep(
+                    urdf_path=config.ee_urdf_path,
+                    motor_names=motor_names,
+                )
+            )
+        else:
+            raise ValueError(
+                f"Unknown ee_action_space '{config.ee_action_space}'. "
+                "Choose from 'joint_pos', 'ee_pose_abs', 'ee_pose_delta'."
+            )
+
+    input_steps += [
         # 3. Pack video/state/action/language/embodiment; apply optional min-max normalization before padding
         GrootPackInputsStep(
             state_horizon=state_horizon,
@@ -143,12 +210,17 @@ def make_groot_pre_post_processors(
             stats=padded_stats,
         ),
         # 4. Eagle encode (creates eagle_content)
+        # N1.6 uses Eagle3 (bundled with gr00t); N1.5 uses the cached Eagle2 HF processor.
         GrootEagleEncodeStep(
-            tokenizer_assets_repo=config.tokenizer_assets_repo,
+            tokenizer_assets_repo=(
+                _get_eagle3_local_path() if config.model_version == "n1.6" else config.tokenizer_assets_repo
+            ),
         ),
         # 5. Collate eagle_content -> eagle_* tensors
         GrootEagleCollateStep(
-            tokenizer_assets_repo=config.tokenizer_assets_repo,
+            tokenizer_assets_repo=(
+                _get_eagle3_local_path() if config.model_version == "n1.6" else config.tokenizer_assets_repo
+            ),
         ),
         # 6. Move to device
         DeviceProcessorStep(device=config.device),
@@ -195,22 +267,91 @@ def _to_uint8_np_bhwc(img_t: torch.Tensor) -> np.ndarray:
 
 
 def _build_eagle_processor(tokenizer_assets_repo: str = DEFAULT_TOKENIZER_ASSETS_REPO) -> ProcessorMixin:
-    # Validate that the cache directory is ready. If not, instruct the user.
-    cache_dir = HF_LEROBOT_HOME / tokenizer_assets_repo
-    required = [
-        cache_dir / "processor_config.json",
-        cache_dir / "preprocessor_config.json",
-        cache_dir / "image_processing_eagle2_5_vl_fast.py",
-    ]
-    if not all(p.exists() for p in required):
-        raise FileNotFoundError(
-            f"[GROOT] Eagle processor cache at '{cache_dir}' is not populated. "
-            "Vendor files are copied during model creation. Create the policy/model first, "
-            "or call ensure_eagle_cache_ready() before building processors."
-        )
+    from pathlib import Path as _Path
+
+    _repo = _Path(tokenizer_assets_repo)
+    if _repo.is_absolute():
+        # Local absolute path — used for N1.6's Eagle3 processor bundled with gr00t.
+        cache_dir = _repo
+        if not (cache_dir / "processor_config.json").exists():
+            raise FileNotFoundError(
+                f"[GROOT] Eagle3 processor not found at '{cache_dir}'. "
+                "Ensure the gr00t package is installed and its Eagle-Block2A-2B-v2 assets are present."
+            )
+    else:
+        # Relative HF-cache path — used for N1.5's Eagle2 processor.
+        cache_dir = HF_LEROBOT_HOME / tokenizer_assets_repo
+        required = [
+            cache_dir / "processor_config.json",
+            cache_dir / "preprocessor_config.json",
+            cache_dir / "image_processing_eagle2_5_vl_fast.py",
+        ]
+        if not all(p.exists() for p in required):
+            raise FileNotFoundError(
+                f"[GROOT] Eagle processor cache at '{cache_dir}' is not populated. "
+                "Vendor files are copied during model creation. Create the policy/model first, "
+                "or call ensure_eagle_cache_ready() before building processors."
+            )
     proc = AutoProcessor.from_pretrained(str(cache_dir), trust_remote_code=True, use_fast=True)
     proc.tokenizer.padding_side = "left"
+
+    # Compatibility shims for transformers >=4.53 vs the cached Eagle3 processor code.
+    # The module is now loaded (trust_remote_code imports it), so we can patch it here.
+    if hasattr(proc, "image_processor") and "Eagle3" in type(proc.image_processor).__name__:
+        import inspect as _inspect_patch
+        import sys as _sys_patch
+
+        _img_proc_cls = type(proc.image_processor)
+
+        # Shim 1: _preprocess doesn't declare extra kwargs (e.g. disable_grouping) that
+        # transformers >=4.53 injects via the base TypedDict.  Filter them before the call.
+        if not getattr(_img_proc_cls, "_lerobot_patched", False):
+            _orig_inner = _img_proc_cls._preprocess
+            _valid_kwargs = set(_inspect_patch.signature(_orig_inner).parameters.keys()) - {"self"}
+
+            def _patched_inner(self, images, **kwargs):
+                _extra = set(kwargs.keys()) - _valid_kwargs
+                if _extra:
+                    print(f"[GROOT] Eagle3 _preprocess: dropping unknown kwargs {_extra}")
+                return _orig_inner(self, images, **{k: v for k, v in kwargs.items() if k in _valid_kwargs})
+
+            _img_proc_cls._preprocess = _patched_inner
+            _img_proc_cls._lerobot_patched = True
+
+        # Shim 2: group_images_by_shape gained a required `disable_grouping` arg in transformers
+        # >=4.53, but the cached Eagle3 _preprocess calls it as group_images_by_shape(images).
+        # Find the Eagle3 image-processor module and give group_images_by_shape a default.
+        for _mod in _sys_patch.modules.values():
+            if (
+                getattr(_mod, "__file__", None)
+                and "Eagle-Block2A-2B-v2" in str(_mod.__file__)
+                and "image_processing_eagle3_vl_fast" in str(_mod.__file__)
+            ):
+                _orig_group = getattr(_mod, "group_images_by_shape", None)
+                if _orig_group is not None and not getattr(_orig_group, "_lerobot_patched", False):
+                    _sig = _inspect_patch.signature(_orig_group)
+                    _dg_param = _sig.parameters.get("disable_grouping")
+                    if _dg_param is not None and _dg_param.default is _inspect_patch.Parameter.empty:
+                        # Required positional — wrap to provide False as default.
+                        def _patched_group(images, disable_grouping=False, _fn=_orig_group):
+                            return _fn(images, disable_grouping)
+                        _patched_group._lerobot_patched = True
+                        _mod.group_images_by_shape = _patched_group
+                        print("[GROOT] Patched group_images_by_shape in Eagle3 module (disable_grouping default=False)")
+                break
+
     return proc
+
+
+def _get_eagle3_local_path() -> str:
+    """Return the absolute path to the Eagle-Block2A-2B-v2 processor bundled with gr00t."""
+    import os as _os
+    from pathlib import Path as _Path
+    import gr00t.model.gr00t_n1d6.processing_gr00t_n1d6 as _gr00t_proc
+
+    return str(
+        (_Path(_gr00t_proc.__file__).parent.parent / "modules" / "nvidia" / "Eagle-Block2A-2B-v2").resolve()
+    )
 
 
 @dataclass
@@ -512,10 +653,17 @@ def collate(features: list[dict[str, Any]], eagle_processor: ProcessorMixin) -> 
                 curr_image_inputs = v["image_inputs"]
                 text_list += curr_text_list
                 image_inputs += curr_image_inputs
+            # Eagle2 (N1.5) requires dynamic-tile hints; Eagle3 (N1.6) doesn't accept them.
+            _img_proc_cls = type(eagle_processor.image_processor).__name__
+            _eagle2_images_kwargs = (
+                {"min_dynamic_tiles": 1, "max_dynamic_tiles": 1, "use_thumbnail": False}
+                if "Eagle3" not in _img_proc_cls
+                else {}
+            )
             eagle_inputs = eagle_processor(
                 text=text_list,
                 images=image_inputs,
-                images_kwargs={"min_dynamic_tiles": 1, "max_dynamic_tiles": 1, "use_thumbnail": False},
+                images_kwargs=_eagle2_images_kwargs,
                 return_tensors="pt",
                 padding=True,
             )

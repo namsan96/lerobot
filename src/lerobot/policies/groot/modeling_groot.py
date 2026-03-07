@@ -64,24 +64,33 @@ class GrootPolicy(PreTrainedPolicy):
         """Create and initialize the GR00T model using Isaac-GR00T API.
 
         This is only called when creating a NEW policy (not when loading from checkpoint).
-
-        Steps (delegating to Isaac-GR00T):
-        1) Download and load pretrained model via GR00TN15.from_pretrained
-        2) Align action horizon with data_config if provided
+        Dispatches to GR00TN15 (N1.5) or GR00TN1d6 (N1.6) based on config.model_version.
         """
         # Handle Flash Attention compatibility issues
         self._handle_flash_attention_compatibility()
 
-        model = GR00TN15.from_pretrained(
-            pretrained_model_name_or_path=self.config.base_model_path,
-            tune_llm=self.config.tune_llm,
-            tune_visual=self.config.tune_visual,
-            tune_projector=self.config.tune_projector,
-            tune_diffusion_model=self.config.tune_diffusion_model,
-        )
+        if self.config.model_version == "n1.6":
+            from lerobot.policies.groot.groot_n1d6 import GR00TN1d6
 
-        model.compute_dtype = "bfloat16" if self.config.use_bf16 else model.compute_dtype
-        model.config.compute_dtype = model.compute_dtype
+            model = GR00TN1d6.from_pretrained(
+                pretrained_model_name_or_path=self.config.base_model_path,
+                tune_llm=self.config.tune_llm,
+                tune_visual=self.config.tune_visual,
+                tune_top_llm_layers=self.config.tune_top_llm_layers,
+                tune_projector=self.config.tune_projector,
+                tune_diffusion_model=self.config.tune_diffusion_model,
+                tune_vlln=self.config.tune_vlln,
+            )
+        else:
+            model = GR00TN15.from_pretrained(
+                pretrained_model_name_or_path=self.config.base_model_path,
+                tune_llm=self.config.tune_llm,
+                tune_visual=self.config.tune_visual,
+                tune_projector=self.config.tune_projector,
+                tune_diffusion_model=self.config.tune_diffusion_model,
+            )
+            model.compute_dtype = "bfloat16" if self.config.use_bf16 else model.compute_dtype
+            model.config.compute_dtype = model.compute_dtype
 
         return model
 
@@ -104,6 +113,14 @@ class GrootPolicy(PreTrainedPolicy):
             for k, v in batch.items()
             if (k in allowed_base or k.startswith("eagle_")) and not (k.startswith("next.") or k == "info")
         }
+
+        # N1.6 EagleBackbone.forward expects bare keys (input_ids, attention_mask, pixel_values)
+        # rather than the eagle_* prefixed keys produced by the N1.5-style preprocessor.
+        if self.config.model_version == "n1.6":
+            groot_inputs = {
+                (k.removeprefix("eagle_") if k.startswith("eagle_") else k): v
+                for k, v in groot_inputs.items()
+            }
 
         # Get device from model parameters
         device = next(self.parameters()).device
@@ -137,6 +154,14 @@ class GrootPolicy(PreTrainedPolicy):
             for k, v in batch.items()
             if (k in allowed_base or k.startswith("eagle_")) and not (k.startswith("next.") or k == "info")
         }
+
+        # N1.6 EagleBackbone.forward expects bare keys (input_ids, attention_mask, pixel_values)
+        # rather than the eagle_* prefixed keys produced by the N1.5-style preprocessor.
+        if self.config.model_version == "n1.6":
+            groot_inputs = {
+                (k.removeprefix("eagle_") if k.startswith("eagle_") else k): v
+                for k, v in groot_inputs.items()
+            }
 
         # Get device from model parameters
         device = next(self.parameters()).device

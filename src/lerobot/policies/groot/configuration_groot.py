@@ -53,6 +53,9 @@ class GrootConfig(PreTrainedConfig):
 
     # Groot-specific model parameters (from groot_finetune_script.py)
 
+    # Model version selector: "n1.5" uses ported GR00TN15, "n1.6" uses Gr00tN1d6 from gr00t package.
+    model_version: str = "n1.5"
+
     # Path or HuggingFace model ID for the base Groot model
     base_model_path: str = "nvidia/GR00T-N1.5-3B"
 
@@ -75,6 +78,18 @@ class GrootConfig(PreTrainedConfig):
 
     # Whether to fine-tune the diffusion model
     tune_diffusion_model: bool = True
+
+    # N1.6-specific: fine-tune the VL LayerNorm in action head (ignored for N1.5)
+    tune_vlln: bool = True
+
+    # N1.6-specific: number of top LLM layers to tune even when tune_llm=False (ignored for N1.5)
+    tune_top_llm_layers: int = 4
+
+    # N1.6-specific: state dropout probability during training (ignored for N1.5)
+    state_dropout_prob: float = 0.0
+
+    # N1.6-specific: scale of additive Gaussian noise on state features during training (ignored for N1.5)
+    state_additive_noise_scale: float = 0.0
 
     # LoRA parameters (from groot_finetune_script.py)
     # Rank for the LORA model. If 0, no LORA will be used.
@@ -107,6 +122,20 @@ class GrootConfig(PreTrainedConfig):
     # Whether to sample trajectories weighted by their length
     balance_trajectory_weights: bool = True
 
+    # EE action space settings (mirroring DiffusionConfig)
+    # "joint_pos"    : default — train directly in joint space.
+    # "ee_pose_abs"  : replace action with FK(teleop_joints) → 7D (x,y,z,wx,wy,wz,gripper_pos).
+    # "ee_pose_delta": replace action with 7D delta EE relative to current follower EE.
+    ee_action_space: str = "joint_pos"
+    # Robot type used to look up hardcoded motor names.  Currently only "so101" is supported.
+    ee_robot_type: str = "so101"
+    # Path to the robot URDF for FK.  Required when ee_action_space != "joint_pos".
+    ee_urdf_path: str | None = None
+    # Normalization bounds for the 6D EE pose part of the action (no gripper).
+    # Layout: [x/dx, y/dy, z/dz, wx/dwx, wy/dwy, wz/dwz]  (6 values).
+    # Gripper dim is appended automatically from dataset stats.
+    ee_action_stats: dict | None = None
+
     # Optional dataset paths for delegating training to Isaac-GR00T runner
     dataset_paths: list[str] | None = None
     output_dir: str = "./tmp/gr00t"
@@ -125,8 +154,13 @@ class GrootConfig(PreTrainedConfig):
                 f"n_action_steps ({self.n_action_steps}) cannot exceed chunk_size ({self.chunk_size})"
             )
 
-        # groot_repo_path is now optional since we ported the components
-        # No validation needed
+        # N1.6 pretrained model uses max_state_dim=128 and max_action_dim=128.
+        # Bump the defaults when the user hasn't overridden them and is using N1.6.
+        if self.model_version == "n1.6":
+            if self.max_state_dim == 64:  # still at N1.5 default
+                self.max_state_dim = 128
+            if self.max_action_dim == 32:  # still at N1.5 default
+                self.max_action_dim = 128
 
     def validate_features(self) -> None:
         """Validate and set up input/output features for Groot."""
@@ -194,6 +228,13 @@ class GrootConfig(PreTrainedConfig):
     def action_delta_indices(self) -> list[int]:
         """Return indices for delta actions."""
         return list(range(min(self.chunk_size, 16)))
+
+    @property
+    def auxiliary_delta_indices(self) -> dict | None:
+        """Load co-recorded follower state at action timesteps for ee_pose_delta training."""
+        if self.ee_action_space == "ee_pose_delta":
+            return {"aux.curr_state": ("observation.state", self.action_delta_indices)}
+        return None
 
     @property
     def reward_delta_indices(self) -> None:
