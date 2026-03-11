@@ -92,6 +92,12 @@ class PolicyServerConfig:
         metadata={"help": "Enable mixed-precision inference: 'fp16', 'bf16', or None (disabled)."},
     )
 
+    # If True, use the policy's native action steps (do not pass full_length=True to predict_action_chunk).
+    use_pt_act_steps: bool = field(
+        default=False,
+        metadata={"help": "If True, use the policy's native action steps instead of full chunk length."},
+    )
+
     def __post_init__(self):
         """Validate configuration after initialization."""
         if self.port < 1 or self.port > 65535:
