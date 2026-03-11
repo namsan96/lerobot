@@ -267,6 +267,7 @@ class RemotePolicyConfig:
     actions_per_chunk: int
     rename_map: dict[str, str] = field(default_factory=dict)
     commit_steps: int | None = None
+    task: str = ""
 
 
 def _compare_observation_states(obs1_state: torch.Tensor, obs2_state: torch.Tensor, atol: float) -> bool:

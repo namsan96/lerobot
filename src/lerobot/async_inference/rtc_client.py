@@ -109,6 +109,7 @@ class RobotClient:
             actions_per_chunk=config.actions_per_chunk,
             rename_map=getattr(config, "rename_map", {}),
             commit_steps=config.commit_steps if getattr(config, "use_action_cond", False) else None,
+            task=config.task or "",
         )
         self.channel = grpc.insecure_channel(
             self.server_address, grpc_channel_options(initial_backoff=f"{config.environment_dt:.4f}s")
@@ -321,14 +322,15 @@ class RobotClient:
         The control loop writes latest_raw_obs then sets observation_requested, so no lock is needed."""
         while self.running:
             self.observation_requested.wait()
-            self.observation_requested.clear()
             raw_obs = self.latest_raw_obs
+            self.observation_requested.clear()
             task = self.task
-            if raw_obs is None or not task:
+            if raw_obs is None:
                 continue
             try:
                 obs_with_task = dict(raw_obs)
-                obs_with_task["task"] = task
+                if task:
+                    obs_with_task["task"] = task
                 observation = TimedObservation(
                     timestamp=time.time(),
                     observation=obs_with_task,
@@ -480,7 +482,37 @@ class RobotClient:
 
                 # Capture observation every iteration (like lerobot_record)
                 raw_obs: RawObservation = self.robot.get_observation()
-                # Write before signaling — observation_sender reads after wait(), no lock needed
+        
+                # TODO : thread-safety is complicated here.
+                # 1. Observation sending will only happen once at a time.
+                # i.e. will never send it again before it gets action response and obs sending is set agian
+                # so the race is only between
+                #   1) latest obs setting here (every loop)
+                #   2) obs sender (once in action prediction. Blocked)
+                # 1), 2) are racing, although 2) simply reads it so may not be a big problem.
+                # In delta EE control, it uses latest_raw_obs as well,
+                # but it is in this loop + blocking so does not race.
+                # actually it is the only reason we should keep update this every loop.
+                # unless we can just set only before setting obs sending request.
+
+                # 2. Having lock here will resolve the race.
+                # However, the timing the obs sender actually send the obs is still not guaranteeed.
+                # although here we mark to send the obs at time t,
+                # obs sender can be slow enough to call it at t+1, t+2, ... any time,
+                # and the lock will only prevent the updating DURING the read.
+
+                # 3. Will it be a problem in RTC scheme?
+                # Possibly. prediction will be all shifted
+
+                # 4. What is the proper way :
+                # wait here until obs requested is unset.
+                # it will wait only right AFTER the loop that request obs sending
+                # : it is better than block everytime it sends which will make this loop takes longer periodically.
+
+                # 5. In practice :
+                # only case it could affect is,
+                # obs sender wakes up and set its local variable holding the p
+                # later than the next raw obs update in this loop
                 self.latest_raw_obs = raw_obs
 
                 # Before the first action : wait

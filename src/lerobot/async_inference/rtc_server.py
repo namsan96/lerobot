@@ -96,6 +96,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.lerobot_features = None
         self.actions_per_chunk = None
         self.commit_steps = None
+        self.task: str = ""
         self.preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None
         self.postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None
 
@@ -186,12 +187,14 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.logger.info(
             f"Receiving session config from {client_id} | "
             f"Actions per chunk: {policy_specs.actions_per_chunk} | "
-            f"Commit steps: {policy_specs.commit_steps}"
+            f"Commit steps: {policy_specs.commit_steps} | "
+            f"Task: '{policy_specs.task}'"
         )
 
         self.lerobot_features = policy_specs.lerobot_features
         self.actions_per_chunk = policy_specs.actions_per_chunk
         self.commit_steps = policy_specs.commit_steps
+        self.task = policy_specs.task or ""
 
         # Rebuild preprocessor with client-provided rename_map (cheap — no policy reload)
         device_override = {"device": self.device}
@@ -371,7 +374,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             kwargs["action_cond"] = self.last_action_chunk[:, self.commit_steps:, :]
 
         with self._policy_lock, torch.amp.autocast(**self._autocast_kwargs):
-            chunk = self.policy.predict_action_chunk(batch, full_length=True, **kwargs)
+            if self.config.use_pt_act_steps:
+                chunk = self.policy.predict_action_chunk(batch, **kwargs)
+            else:
+                chunk = self.policy.predict_action_chunk(batch, full_length=True, **kwargs)
         if chunk.ndim != 3:
             chunk = chunk.unsqueeze(0)  # adding batch dimension, now shape is (B, chunk_size, action_dim)
 
@@ -395,8 +401,13 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         """
         """1. Prepare observation"""
         start_prepare = time.perf_counter()
+        raw_obs = observation_t.get_observation()
+        # Fall back to the session-level task if the observation doesn't carry one
+        if "task" not in raw_obs and self.task:
+            raw_obs = dict(raw_obs)
+            raw_obs["task"] = self.task
         observation: Observation = raw_observation_to_observation(
-            observation_t.get_observation(),
+            raw_obs,
             self.lerobot_features,
             self.policy_image_features,
         )
