@@ -157,15 +157,19 @@ class SO101Follower(Robot):
         print("Calibration saved to", self.calibration_fpath)
 
     def configure(self) -> None:
+        P = 16
+        I = 0
+        D = 8  # originally 32
+        logger.info(f'Setting PID to : {P}, {I}, {D}')
         with self.bus.torque_disabled():
             self.bus.configure_motors()
             for motor in self.bus.motors:
                 self.bus.write("Operating_Mode", motor, OperatingMode.POSITION.value)
                 # Set P_Coefficient to lower value to avoid shakiness (Default is 32)
-                self.bus.write("P_Coefficient", motor, 16)
+                self.bus.write("P_Coefficient", motor, P)
                 # Set I_Coefficient and D_Coefficient to default value 0 and 32
-                self.bus.write("I_Coefficient", motor, 0)
-                self.bus.write("D_Coefficient", motor, 32)
+                self.bus.write("I_Coefficient", motor, I)
+                self.bus.write("D_Coefficient", motor, D)
 
                 if motor == "gripper":
                     self.bus.write(
