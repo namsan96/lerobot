@@ -40,6 +40,8 @@ class DatasetConfig:
     # Load all video frames into RAM at init for faster __getitem__ (high memory use).
     cache_videos: bool = False
     cache_video_resize: tuple[int, int] | None = None
+    # Camera keys to exclude from loading (e.g. ["observation.images.side"]).
+    drop_cameras: list[str] = field(default_factory=list)
 
 
 @dataclass

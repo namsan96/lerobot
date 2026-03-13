@@ -578,6 +578,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         batch_encoding_size: int = 1,
         cache_videos: bool = False,
         cache_video_resize: tuple[int, int] | None = None,
+        drop_cameras: list[str] | None = None,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -725,6 +726,14 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.meta = LeRobotDatasetMetadata(
             self.repo_id, self.root, self.revision, force_cache_sync=force_cache_sync
         )
+
+        # Drop unwanted camera keys from metadata so they are never decoded
+        if drop_cameras:
+            for key in drop_cameras:
+                if key in self.meta.info["features"]:
+                    del self.meta.info["features"][key]
+                if self.delta_timestamps is not None and key in self.delta_timestamps:
+                    del self.delta_timestamps[key]
 
         # Track dataset state for efficient incremental writing
         self._lazy_loading = False
