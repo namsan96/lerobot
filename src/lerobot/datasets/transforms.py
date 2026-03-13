@@ -15,7 +15,7 @@
 # limitations under the License.
 import collections
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any
 
 import torch
@@ -163,12 +163,56 @@ class ImageTransformConfig:
 
 
 @dataclass
+class ImageTransformsTfsConfig:
+    """Named transform slots — each can be overridden individually via CLI."""
+
+    brightness: ImageTransformConfig = field(
+        default_factory=lambda: ImageTransformConfig(
+            weight=1.0, type="ColorJitter", kwargs={"brightness": (0.8, 1.2)}
+        )
+    )
+    contrast: ImageTransformConfig = field(
+        default_factory=lambda: ImageTransformConfig(
+            weight=1.0, type="ColorJitter", kwargs={"contrast": (0.8, 1.2)}
+        )
+    )
+    saturation: ImageTransformConfig = field(
+        default_factory=lambda: ImageTransformConfig(
+            weight=1.0, type="ColorJitter", kwargs={"saturation": (0.5, 1.5)}
+        )
+    )
+    hue: ImageTransformConfig = field(
+        default_factory=lambda: ImageTransformConfig(
+            weight=1.0, type="ColorJitter", kwargs={"hue": (-0.05, 0.05)}
+        )
+    )
+    sharpness: ImageTransformConfig = field(
+        default_factory=lambda: ImageTransformConfig(
+            weight=1.0, type="SharpnessJitter", kwargs={"sharpness": (0.5, 1.5)}
+        )
+    )
+    affine: ImageTransformConfig = field(
+        default_factory=lambda: ImageTransformConfig(
+            weight=1.0, type="RandomAffine", kwargs={"degrees": (-5.0, 5.0), "translate": (0.05, 0.05)}
+        )
+    )
+    rgb_shuffle: ImageTransformConfig = field(
+        default_factory=lambda: ImageTransformConfig(
+            weight=0.0, type="RandomChannelPermutation", kwargs={}
+        )
+    )
+
+
+@dataclass
 class ImageTransformsConfig:
     """
     These transforms are all using standard torchvision.transforms.v2
     You can find out how these transformations affect images here:
     https://pytorch.org/vision/0.18/auto_examples/transforms/plot_transforms_illustrations.html
     We use a custom RandomSubsetApply container to sample them.
+
+    To turn a transform off: set its weight to 0 (e.g. --dataset.image_transforms.tfs.rgb_shuffle.weight=0).
+    Transforms with weight <= 0 are skipped.
     """
 
     # Set this flag to `true` to enable transforms during training
@@ -179,40 +223,7 @@ class ImageTransformsConfig:
     # By default, transforms are applied in Torchvision's suggested order (shown below).
     # Set this to True to apply them in a random order.
     random_order: bool = False
-    tfs: dict[str, ImageTransformConfig] = field(
-        default_factory=lambda: {
-            "brightness": ImageTransformConfig(
-                weight=1.0,
-                type="ColorJitter",
-                kwargs={"brightness": (0.8, 1.2)},
-            ),
-            "contrast": ImageTransformConfig(
-                weight=1.0,
-                type="ColorJitter",
-                kwargs={"contrast": (0.8, 1.2)},
-            ),
-            "saturation": ImageTransformConfig(
-                weight=1.0,
-                type="ColorJitter",
-                kwargs={"saturation": (0.5, 1.5)},
-            ),
-            "hue": ImageTransformConfig(
-                weight=1.0,
-                type="ColorJitter",
-                kwargs={"hue": (-0.05, 0.05)},
-            ),
-            "sharpness": ImageTransformConfig(
-                weight=1.0,
-                type="SharpnessJitter",
-                kwargs={"sharpness": (0.5, 1.5)},
-            ),
-            "affine": ImageTransformConfig(
-                weight=1.0,
-                type="RandomAffine",
-                kwargs={"degrees": (-5.0, 5.0), "translate": (0.05, 0.05)},
-            ),
-        }
-    )
+    tfs: ImageTransformsTfsConfig = field(default_factory=ImageTransformsTfsConfig)
 
 
 def make_transform_from_config(cfg: ImageTransformConfig):
@@ -224,6 +235,8 @@ def make_transform_from_config(cfg: ImageTransformConfig):
         return SharpnessJitter(**cfg.kwargs)
     elif cfg.type == "RandomAffine":
         return v2.RandomAffine(**cfg.kwargs)
+    elif cfg.type == "RandomChannelPermutation":
+        return v2.RandomChannelPermutation(**cfg.kwargs)
     else:
         raise ValueError(f"Transform '{cfg.type}' is not valid.")
 
@@ -237,7 +250,9 @@ class ImageTransforms(Transform):
 
         self.weights = []
         self.transforms = {}
-        for tf_name, tf_cfg in cfg.tfs.items():
+        for f in fields(cfg.tfs):
+            tf_name = f.name
+            tf_cfg = getattr(cfg.tfs, tf_name)
             if tf_cfg.weight <= 0.0:
                 continue
 
