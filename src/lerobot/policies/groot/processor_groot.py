@@ -311,8 +311,6 @@ def _build_eagle_processor(tokenizer_assets_repo: str = DEFAULT_TOKENIZER_ASSETS
 
             def _patched_inner(self, images, **kwargs):
                 _extra = set(kwargs.keys()) - _valid_kwargs
-                if _extra:
-                    print(f"[GROOT] Eagle3 _preprocess: dropping unknown kwargs {_extra}")
                 return _orig_inner(self, images, **{k: v for k, v in kwargs.items() if k in _valid_kwargs})
 
             _img_proc_cls._preprocess = _patched_inner
