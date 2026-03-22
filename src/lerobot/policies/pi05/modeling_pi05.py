@@ -1068,6 +1068,11 @@ class PI05Policy(PreTrainedPolicy):
             if img.dtype != torch.float32:
                 img = img.to(torch.float32)
 
+            # Pi05 only supports n_obs_steps=1; squeeze temporal dim if present
+            if img.dim() == 5:
+                assert img.shape[1] == 1, f"Pi05 only supports n_obs_steps=1, got {img.shape[1]}"
+                img = img.squeeze(1)
+
             # from openpi preprocess_observation_pytorch: Handle both [B, C, H, W] and [B, H, W, C] formats
             is_channels_first = img.shape[1] == 3  # Check if channels are in dimension 1
 
