@@ -296,7 +296,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             return services_pb2.Empty()
 
         except Exception as e:
-            self.logger.error(f"Error in StreamActions: {e}")
+            self.logger.error(f"Error in StreamActions: {e}", exc_info=True)
 
             return services_pb2.Empty()
 
