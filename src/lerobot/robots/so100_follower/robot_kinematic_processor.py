@@ -445,6 +445,91 @@ class DeltaEEToAbsoluteEEStep(RobotActionProcessorStep):
         return features
 
 
+@ProcessorStepRegistry.register("chunk_delta_ee_to_absolute_ee")
+@dataclass
+class ChunkDeltaEEToAbsoluteEEStep(RobotActionProcessorStep):
+    """
+    Converts a chunk-delta end-effector action into an absolute EE target pose.
+
+    Used at inference time when the policy was trained with ``ee_pose_chunk_delta`` action space.
+    In that mode, every action in the chunk is expressed as a delta relative to the follower EE
+    at the *start* of the chunk (not the current follower EE at each step).
+
+    The reference pose ``T_ref = FK(follower_joints)`` is captured from the observation on the
+    first ``action()`` call after ``reset_chunk()`` is invoked, and then held fixed for all
+    remaining steps of that chunk.
+
+    Signaling chunk boundaries
+    --------------------------
+    The policy must call ``reset_chunk()`` whenever it generates a new action chunk (i.e. the
+    moment the action queue was empty and a fresh chunk was predicted).  The recommended wiring
+    is to register this method as a callback in the policy::
+
+        policy.register_new_chunk_callback(chunk_step.reset_chunk)
+
+    and have ``select_action`` call all registered callbacks when ``len(self._queues[ACTION]) == 0``.
+
+    Attributes:
+        kinematics:           FK solver for the follower robot.
+        follower_motor_names: Motor names in the same order as observation joint positions.
+    """
+
+    kinematics: RobotKinematics
+    follower_motor_names: list[str]
+    _T_ref: np.ndarray | None = field(default=None, init=False, repr=False)
+
+    def reset_chunk(self, T_ref: "np.ndarray | None" = None) -> None:
+        """Signal that a new action chunk has started.
+
+        Args:
+            T_ref: Optional (4, 4) SE(3) reference pose to pre-set for the incoming chunk.
+                   If provided, this pose is used directly instead of capturing from the
+                   current observation on the first action step.  Pass the follower EE pose
+                   at the time the corresponding observation was sent to the policy server so
+                   that T_ref matches the anchor used during training.
+        """
+        self._T_ref = T_ref
+
+    def action(self, action: RobotAction) -> RobotAction:
+        obs = self.transition.get(TransitionKey.OBSERVATION)
+        if obs is None:
+            raise ValueError("ChunkDeltaEEToAbsoluteEEStep requires an observation in the transition.")
+
+        # Capture T_ref from the current follower state on the first step of each chunk.
+        if self._T_ref is None:
+            current_joints = np.array(
+                [float(obs[f"{name}.pos"]) for name in self.follower_motor_names if name != "gripper"],
+                dtype=float,
+            )
+            self._T_ref = self.kinematics.forward_kinematics(current_joints)
+
+        # Read delta EE from action
+        delta_pos = np.array([action["ee.x"], action["ee.y"], action["ee.z"]], dtype=float)
+        delta_R = Rotation.from_rotvec([action["ee.wx"], action["ee.wy"], action["ee.wz"]]).as_matrix()
+
+        # Compose: T_goal = T_ref ⊕ delta_T  (delta expressed in world frame)
+        T_goal = np.eye(4, dtype=float)
+        T_goal[:3, :3] = self._T_ref[:3, :3] @ delta_R
+        T_goal[:3, 3] = self._T_ref[:3, 3] + delta_pos
+
+        abs_pos = T_goal[:3, 3]
+        abs_rotvec = Rotation.from_matrix(T_goal[:3, :3]).as_rotvec()
+
+        action["ee.x"] = float(abs_pos[0])
+        action["ee.y"] = float(abs_pos[1])
+        action["ee.z"] = float(abs_pos[2])
+        action["ee.wx"] = float(abs_rotvec[0])
+        action["ee.wy"] = float(abs_rotvec[1])
+        action["ee.wz"] = float(abs_rotvec[2])
+        # ee.gripper_pos passes through unchanged
+        return action
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
+
+
 @ProcessorStepRegistry.register("gripper_velocity_to_joint")
 @dataclass
 class GripperVelocityToJoint(RobotActionProcessorStep):
@@ -668,10 +753,15 @@ def make_policy_robot_action_processor(
             kinematics=kinematics,
             follower_motor_names=motor_names,
         ))
+    elif ee_action_space == "ee_pose_chunk_delta":
+        steps.append(ChunkDeltaEEToAbsoluteEEStep(
+            kinematics=kinematics,
+            follower_motor_names=motor_names,
+        ))
     elif ee_action_space != "ee_pose_abs":
         raise ValueError(
             f"Unknown ee_action_space '{ee_action_space}'. "
-            "Choose from 'joint_pos', 'ee_pose_abs', 'ee_pose_delta'."
+            "Choose from 'joint_pos', 'ee_pose_abs', 'ee_pose_delta', 'ee_pose_chunk_delta'."
         )
 
     steps.extend([

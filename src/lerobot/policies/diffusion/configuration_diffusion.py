@@ -125,8 +125,9 @@ class DiffusionConfig(PreTrainedConfig):
     # "joint_pos"    : default — no transform, train directly in joint space.
     # "ee_pose_abs"  : replace action with FK(teleop_joints) → 7D (x,y,z,wx,wy,wz,gripper_pos).
     #                  At inference, IK converts policy output back to joint positions.
-    # "ee_pose_delta": replace action with 7D delta EE relative to current follower EE.
-    #                  At inference, DeltaEEToAbsoluteEEStep + IK converts to joint positions.
+    # "ee_pose_delta":       replace action with 7D delta EE relative to current follower EE[t].
+    # "ee_pose_chunk_delta": replace action with 7D delta EE relative to follower EE[0] (start of chunk).
+    #                        At inference, DeltaEEToAbsoluteEEStep + IK converts to joint positions.
     ee_action_space: str = "joint_pos"
     # Robot type used to look up hardcoded motor names.  Currently only "so101" is supported;
     # any other value will raise a NotImplementedError at pre-processor construction time.
@@ -284,12 +285,12 @@ class DiffusionConfig(PreTrainedConfig):
 
     @property
     def auxiliary_delta_indices(self) -> dict | None:
-        """Load co-recorded follower state at action timesteps for ee_pose_delta training.
+        """Load co-recorded follower state at action timesteps for delta EE training.
 
         The output key ``"aux.curr_state"`` carries follower joints at each action horizon
-        step, allowing JointActionToDeltaEEStep to compute per-step delta EE targets.
+        step, used by JointActionToDeltaEEStep and JointActionToChunkDeltaEEStep.
         """
-        if self.ee_action_space == "ee_pose_delta":
+        if self.ee_action_space in ("ee_pose_delta", "ee_pose_chunk_delta"):
             return {"aux.curr_state": ("observation.state", self.action_delta_indices)}
         return None
 

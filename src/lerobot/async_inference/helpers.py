@@ -228,6 +228,9 @@ class TimedAction(TimedData):
 class TimedObservation(TimedData):
     observation: RawObservation
     must_go: bool = False
+    # Processed (unnormalized) action chunk tail from the previous inference call,
+    # used as action_cond for the next inference call.  None on the very first call.
+    action_cond: torch.Tensor | None = None
 
     def get_observation(self):
         return self.observation

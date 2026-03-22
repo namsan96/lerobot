@@ -21,6 +21,7 @@ import torch
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.diffusion.joint_to_ee_processor import (
     JointActionToAbsEEStep,
+    JointActionToChunkDeltaEEStep,
     JointActionToDeltaEEStep,
 )
 from lerobot.processor import (
@@ -150,10 +151,17 @@ def make_diffusion_pre_post_processors(
                     motor_names=motor_names,
                 )
             )
+        elif config.ee_action_space == "ee_pose_chunk_delta":
+            input_steps.append(
+                JointActionToChunkDeltaEEStep(
+                    urdf_path=config.ee_urdf_path,
+                    motor_names=motor_names,
+                )
+            )
         else:
             raise ValueError(
                 f"Unknown ee_action_space '{config.ee_action_space}'. "
-                "Choose from 'joint_pos', 'ee_pose_abs', 'ee_pose_delta'."
+                "Choose from 'joint_pos', 'ee_pose_abs', 'ee_pose_delta', 'ee_pose_chunk_delta'."
             )
 
     input_steps.append(

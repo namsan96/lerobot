@@ -64,7 +64,8 @@ from lerobot.transport import (
     services_pb2_grpc,  # type: ignore
 )
 from lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
-from lerobot.utils.constants import ACTION, OBS_STR
+from lerobot.utils.constants import ACTION, OBS_STATE, OBS_STR
+from scipy.spatial.transform import Rotation
 from lerobot.utils.control_utils import init_keyboard_listener, sanity_check_dataset_robot_compatibility
 
 
@@ -124,6 +125,9 @@ class RobotClient:
         self.new_action_chunk_ready = threading.Event()
         self.new_action_chunk = None
         self.action_chunk = None
+        # ee_pose_chunk_delta: T_ref (4×4) from observation send time, adopted at chunk arrival.
+        self.pending_ee_for_chunk: "np.ndarray | None" = None  # set in observation_sender
+        self.last_ee_for_chunk: "np.ndarray | None" = None    # adopted at chunk adoption
 
         self.start_barrier = threading.Barrier(2)  # 2 threads: action receiver, control loop
 
@@ -183,6 +187,14 @@ class RobotClient:
             motor_names=motor_names,
             ee_urdf_path=config.ee_urdf_path,
         )
+        # For ee_pose_chunk_delta: hold a reference to the step so we can signal chunk boundaries.
+        self._chunk_delta_step = None
+        if config.ee_action_space == "ee_pose_chunk_delta":
+            from lerobot.robots.so100_follower.robot_kinematic_processor import ChunkDeltaEEToAbsoluteEEStep
+            for step in self.robot_action_processor.steps:
+                if isinstance(step, ChunkDeltaEEToAbsoluteEEStep):
+                    self._chunk_delta_step = step
+                    break
 
         # e.g. downsample = 4 => a3, a7, ...
         # chunk 7 => horizon 1 / chunk 8 => horizon 2
@@ -333,10 +345,33 @@ class RobotClient:
                 obs_with_task = dict(raw_obs)
                 if task:
                     obs_with_task["task"] = task
+
+                action_cond = None
+                if getattr(self.config, "use_action_cond", False):
+                    action_chunk = self.action_chunk  # snapshot (written by receive_actions thread)
+                    if action_chunk is not None:
+                        action_cond = torch.stack([a.get_action() for a in action_chunk])[self.commit_steps:]
+                        if self.config.ee_action_space == "ee_pose_chunk_delta":
+                            joints = np.array(raw_obs[OBS_STATE], dtype=float)
+                            T_cur = self._chunk_delta_step.kinematics.forward_kinematics(joints[:-1])
+                            # Save T at observation send time; adopted as last_ee_for_chunk when chunk arrives.
+                            self.pending_ee_for_chunk = T_cur
+                            T_last = self.last_ee_for_chunk  # T_ref used when last chunk was generated
+                            # Correct each step: delta_R_new = R_cur.T @ R_last @ delta_R_old
+                            R_correction = T_cur[:3, :3].T @ T_last[:3, :3]  # (3, 3)
+                            pos_correction = T_last[:3, 3] - T_cur[:3, 3]  # (3,)
+                            action_np = action_cond.numpy().copy()  # (H', 7)
+                            for i in range(len(action_np)):
+                                action_np[i, :3] += pos_correction
+                                R_old = Rotation.from_rotvec(action_np[i, 3:6]).as_matrix()
+                                action_np[i, 3:6] = Rotation.from_matrix(R_correction @ R_old).as_rotvec()
+                            action_cond = torch.from_numpy(action_np)
+
                 observation = TimedObservation(
                     timestamp=time.time(),
                     observation=obs_with_task,
                     timestep=0,
+                    action_cond=action_cond,
                 )
                 self.send_observation(observation)
             except Exception as e:
@@ -536,6 +571,9 @@ class RobotClient:
                         self.new_action_chunk = None
                         self.new_action_chunk_ready.clear()
                     chunk_idx = 0
+                    if self._chunk_delta_step is not None:
+                        self.last_ee_for_chunk = self.pending_ee_for_chunk
+                        self._chunk_delta_step.reset_chunk(self.last_ee_for_chunk)
 
                 if chunk_idx == self.commit_steps:
                     self.control_loop_observation(verbose)
@@ -547,6 +585,9 @@ class RobotClient:
                             self.new_action_chunk_ready.clear()
                         delay = chunk_idx - self.commit_steps  # even if the action is ready within 1 step (S+1), the first action is skipped
                         chunk_idx = delay
+                        if self._chunk_delta_step is not None:
+                            self.last_ee_for_chunk = self.pending_ee_for_chunk
+                            self._chunk_delta_step.reset_chunk(self.last_ee_for_chunk)
                         self.logger.info(f"Action chunk is ready within delay {delay}steps, executing action")
 
                 # Control robot; get back action dict for dataset saving

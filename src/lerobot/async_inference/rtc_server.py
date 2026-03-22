@@ -95,13 +95,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         # Session-specific config (set by SendPolicyInstructions)
         self.lerobot_features = None
         self.actions_per_chunk = None
-        self.commit_steps = None
         self.task: str = ""
         self.preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None
         self.postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None
-
-        # Last action chunk for action-conditioned inference (set when commit_steps is configured)
-        self.last_action_chunk: torch.Tensor | None = None
 
         # Load policy at server startup
         self.device = config.device
@@ -158,8 +154,6 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         with self._predicted_timesteps_lock:
             self._predicted_timesteps = set()
 
-        self.last_action_chunk = None
-
     def Ready(self, request, context):  # noqa: N802
         client_id = context.peer()
         self.logger.info(f"Client {client_id} connected and ready")
@@ -187,13 +181,11 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.logger.info(
             f"Receiving session config from {client_id} | "
             f"Actions per chunk: {policy_specs.actions_per_chunk} | "
-            f"Commit steps: {policy_specs.commit_steps} | "
             f"Task: '{policy_specs.task}'"
         )
 
         self.lerobot_features = policy_specs.lerobot_features
         self.actions_per_chunk = policy_specs.actions_per_chunk
-        self.commit_steps = policy_specs.commit_steps
         self.task = policy_specs.task or ""
 
         # Rebuild preprocessor with client-provided rename_map (cheap — no policy reload)
@@ -354,8 +346,23 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             for i, action in enumerate(action_chunk)
         ]
 
-    def _get_action_chunk(self, observation: dict[str, torch.Tensor]) -> torch.Tensor:
-        """Get an action chunk from the policy. The chunk contains only"""
+    def _normalize_action_cond(self, action_cond: torch.Tensor) -> torch.Tensor:
+        """Normalize a processed (unnormalized) action_cond tensor to policy space
+        by forwarding through the preprocessor's NormalizerProcessorStep."""
+        from lerobot.processor import NormalizerProcessorStep
+        from lerobot.processor.core import TransitionKey
+        for step in self.preprocessor.steps:
+            if isinstance(step, NormalizerProcessorStep):
+                result = step({TransitionKey.ACTION: action_cond.to(self.device)})
+                return result[TransitionKey.ACTION]
+        return action_cond
+
+    def _get_action_chunk(
+        self,
+        observation: dict[str, torch.Tensor],
+        action_cond: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Get an action chunk from the policy."""
         # Policies that use observation queues (e.g. Diffusion, VQ-BeT, TD-MPC) expect
         # _queues to be filled before predict_action_chunk (which stacks from _queues).
         batch = dict(observation)
@@ -370,8 +377,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             self.policy._queues = populate_queues(self.policy._queues, batch)
 
         kwargs = {}
-        if self.commit_steps is not None and self.last_action_chunk is not None:
-            kwargs["action_cond"] = self.last_action_chunk[:, self.commit_steps:, :]
+        if action_cond is not None:
+            # action_cond arrives in processed (unnormalized) space; normalize before passing to policy.
+            kwargs["action_cond"] = self._normalize_action_cond(action_cond).unsqueeze(0)  # (1, H', D)
 
         with self._policy_lock, torch.amp.autocast(**self._autocast_kwargs):
             if self.config.use_pt_act_steps:
@@ -379,14 +387,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             else:
                 chunk = self.policy.predict_action_chunk(batch, full_length=True, **kwargs)
         if chunk.ndim != 3:
-            chunk = chunk.unsqueeze(0)  # adding batch dimension, now shape is (B, chunk_size, action_dim)
+            chunk = chunk.unsqueeze(0)
 
         chunk = chunk[:, : self.actions_per_chunk, :]
-
-        # Save for action-conditioned inference on next call
-        if self.commit_steps is not None:
-            self.last_action_chunk = chunk
-
         return chunk
 
     def _predict_action_chunk(self, observation_t: TimedObservation) -> list[TimedAction]:
@@ -421,7 +424,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         """3. Get action chunk"""
         start_inference = time.perf_counter()
-        action_tensor = self._get_action_chunk(observation)
+        action_tensor = self._get_action_chunk(observation, observation_t.action_cond)
         inference_time = time.perf_counter() - start_inference
         self.logger.info(
             f"Preprocessing and inference took {inference_time:.4f}s, action shape: {action_tensor.shape}"
