@@ -620,7 +620,7 @@ class FlowModel(DiffusionModel):
             )
         )
 
-        self.noise_scheduler.set_timesteps(self.num_inference_steps)
+        # self.noise_scheduler.set_timesteps(self.num_inference_steps)
 
         for i in range(self.num_inference_steps):
             # Flow matching: t in [0, 1). UNet expects continuous timestep (same as in compute_loss).
