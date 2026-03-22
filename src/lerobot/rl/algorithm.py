@@ -31,7 +31,7 @@ class AlgorithmConfig(draccus.ChoiceRegistry, abc.ABC):  # type: ignore[misc]
         return self.get_choice_name(self.__class__)  # type: ignore[return-value]
 
     @abc.abstractmethod
-    def make_algorithm(self, policy: nn.Module) -> "Algorithm":
+    def make_algorithm(self, policy: nn.Module, output_dir=None) -> "Algorithm":
         """Instantiate the algorithm from this config and the given policy."""
         ...
 

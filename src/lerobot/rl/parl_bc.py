@@ -9,6 +9,7 @@ PARLDiffusionPolicy, so this file only owns the optimizers and update schedule.
 """
 
 import copy
+import json
 import logging
 import random
 from dataclasses import dataclass
@@ -16,6 +17,8 @@ from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
+
+from lerobot.datasets.utils import cycle
 
 from lerobot.policies.diffusion.modeling_parl_diffusion import (
     PARLDiffusionPolicy,
@@ -67,11 +70,10 @@ class PARLBCConfig(AlgorithmConfig):
 
     # Debug info: save Q/V trajectories and sampled action chunks every N outer iterations.
     # 0 = disabled.
-    debug_info_freq: int = 0
-    debug_info_dir: str = "debug_info"
+    debug_info_freq: int = 1
 
-    def make_algorithm(self, policy: "PARLDiffusionPolicy") -> "PARLBCAlgorithm":
-        return PARLBCAlgorithm(policy, cfg=self)
+    def make_algorithm(self, policy: "PARLDiffusionPolicy", output_dir=None) -> "PARLBCAlgorithm":
+        return PARLBCAlgorithm(policy, cfg=self, output_dir=output_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +100,7 @@ class PARLBCAlgorithm(Algorithm):
         train(cfg, algorithm_cls=partial(PARLBCAlgorithm, cfg=PARLBCConfig()))
     """
 
-    def __init__(self, policy: PARLDiffusionPolicy, cfg: PARLBCConfig = None) -> None:
+    def __init__(self, policy: PARLDiffusionPolicy, cfg: PARLBCConfig = None, output_dir=None) -> None:
         self.cfg = cfg or PARLBCConfig()
 
         if not isinstance(policy, PARLDiffusionPolicy):
@@ -133,8 +135,13 @@ class PARLBCAlgorithm(Algorithm):
         policy.num_ft_train_steps = self.cfg.num_ft_train_steps
 
         # Optionally freeze image encoder (exclude from actor updates)
+        # modeling_parl_diffusion does not handle
+        # 1) separated vision encoder for critics
+        # 2) separated vision encoder for temporal target policy (ft_diffusion)
+        assert self.cfg.freeze_image_encoder == True
         if self.cfg.freeze_image_encoder and hasattr(policy.diffusion, "rgb_encoder"):
             policy.diffusion.rgb_encoder.requires_grad_(False)
+            del self.ft_diffusion.rgb_encoder  # save memory
 
         # Actor optimizer: diffusion network params that still require grad
         actor_params = [p for p in policy.diffusion.parameters() if p.requires_grad]
@@ -160,7 +167,7 @@ class PARLBCAlgorithm(Algorithm):
         self._current_loader: DataLoader | None = None
         self._data_iter = None
 
-        self._debug_info_dir = Path(cfg.debug_info_dir)
+        self._debug_info_dir = Path(output_dir) / "debug_info" if output_dir is not None else Path("debug_info")
 
     @property
     def policy(self) -> PARLDiffusionPolicy:
@@ -174,12 +181,8 @@ class PARLBCAlgorithm(Algorithm):
         """Pull one batch from the loader, resetting the iterator on epoch end or loader change."""
         if loader is not self._current_loader:
             self._current_loader = loader
-            self._data_iter = iter(loader)
-        try:
-            batch = next(self._data_iter)
-        except StopIteration:
-            self._data_iter = iter(loader)
-            batch = next(self._data_iter)
+            self._data_iter = cycle(loader)
+        batch = next(self._data_iter)
         if self.preprocessor is not None:
             # The preprocessor pipeline (batch_to_transition → processors → transition_to_batch)
             # only preserves obs.*, action, and next.reward/done/truncated.  Keys like "reward",
@@ -201,52 +204,75 @@ class PARLBCAlgorithm(Algorithm):
     # ------------------------------------------------------------------
 
     def _sync_distilling_from_ft(self) -> None:
-        """Copy ft_diffusion → policy.diffusion before actor phase."""
-        self.policy.diffusion.load_state_dict(self.ft_diffusion.state_dict())
+        """Copy ft_diffusion → policy.diffusion before actor phase.
+
+        rgb_encoder was deleted from ft_diffusion to save memory.
+        strict=False lets those frozen keys remain untouched in policy.diffusion.
+        """
+        missing, unexpected = self.policy.diffusion.load_state_dict(
+            self.ft_diffusion.state_dict(), strict=False
+        )
+        bad = [k for k in missing if not k.startswith("rgb_encoder.")]
+        if bad or unexpected:
+            raise RuntimeError(
+                f"Sync mismatch — unexpected missing: {bad}, unexpected: {unexpected}"
+            )
 
     def _sync_ft_from_distilling(self) -> None:
-        """Copy policy.diffusion → ft_diffusion after actor phase."""
-        self.ft_diffusion.load_state_dict(self.policy.diffusion.state_dict())
+        """Copy policy.diffusion → ft_diffusion after actor phase.
+
+        Strip rgb_encoder.* keys that were deleted from ft_diffusion.
+        """
+        sd = {
+            k: v for k, v in self.policy.diffusion.state_dict().items()
+            if not k.startswith("rgb_encoder.")
+        }
+        self.ft_diffusion.load_state_dict(sd, strict=True)
 
     # ------------------------------------------------------------------
     # Main entry point
     # ------------------------------------------------------------------
 
     def update(self, loader: DataLoader, itr: int) -> dict:
-        itr_info: dict = {}
-
         # 1. Reset actor to ft_diffusion before this iteration's distillation
         self._sync_distilling_from_ft()
 
-        # 2. Critic phase
+        # 2. Critic phase — accumulate stats across steps
+        critic_stats_list = []
         for step in range(self.cfg.n_batch_per_itr):
-            print(f'Critic step {step}')
             batch = self._next_batch(loader)
             info = self._critic_update(batch)
-            itr_info.update(info)
+            critic_stats_list.append(info)
+            print(f"  critic itr={itr} step={step}  " + "  ".join(f"{k}={v:.6f}" for k, v in info.items()))
             if step % self.cfg.target_update_freq == 0:
                 self.policy.update_target_q()
-        
         self.critic_optimizer.zero_grad(set_to_none=True)
 
         # 3. Actor phase (after critic warmup, every policy_update_period iterations)
+        actor_stats_list = []
         if itr >= self.cfg.n_critic_warmup_itr and itr % self.cfg.policy_update_period == 0:
             for step in range(self.cfg.n_batch_per_itr):
-                print(f'Policy step {step}')
                 batch = self._next_batch(loader)
                 info = self._actor_update(batch)
-                itr_info.update(info)
-        
+                actor_stats_list.append(info)
+                print(f"  actor  itr={itr} step={step}  " + "  ".join(f"{k}={v:.6f}" for k, v in info.items()))
         self.actor_optimizer.zero_grad(set_to_none=True)
 
         # 4. Push updated actor back to ft_diffusion
         self._sync_ft_from_distilling()
 
+        # Save full per-step history to debug_info_dir/stats.jsonl (one line per iter)
+        self._debug_info_dir.mkdir(parents=True, exist_ok=True)
+        with open(self._debug_info_dir / "stats.jsonl", "a") as f:
+            f.write(json.dumps({"itr": itr, "critic": critic_stats_list, "actor": actor_stats_list}) + "\n")
+
         # 5. Periodic debug info dump
         if self.cfg.debug_info_freq > 0 and itr % self.cfg.debug_info_freq == 0:
             self.debug_info(loader.dataset, itr)
 
-        return itr_info
+        last_critic = critic_stats_list[-1] if critic_stats_list else {}
+        last_actor  = actor_stats_list[-1]  if actor_stats_list  else {}
+        return {**last_critic, **last_actor}
 
     # ------------------------------------------------------------------
     # Critic update
@@ -350,11 +376,10 @@ class PARLBCAlgorithm(Algorithm):
                 batch = _stack_images(batch, policy)
 
                 encoder_tokens, state_flat, cls_tokens_flat = policy.encode_obs(batch)
-                v_feat = torch.cat([state_flat, cls_tokens_flat], dim=-1)
                 action = batch[ACTION][:, :policy._n_act]  # (1, n_act, Da)
 
                 q_vals.append(policy.critic_q(encoder_tokens, state_flat, action).squeeze(0).cpu())
-                v_vals.append(policy.critic_v(v_feat).squeeze(0).cpu())
+                v_vals.append(policy.critic_v(state_flat, cls_tokens_flat).squeeze(0).cpu())
                 actions_ep.append(item[ACTION][0].cpu())  # (Da,) unnormalized (raw from dataset)
 
             # ------------------------------------------------------------------

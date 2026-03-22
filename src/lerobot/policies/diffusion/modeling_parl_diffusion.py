@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 from dataclasses import dataclass, field
 
 import einops
@@ -34,6 +35,9 @@ from torch import Tensor
 from torch.distributions import Categorical
 
 from diffusers.models.attention import BasicTransformerBlock
+
+from speedaug.models.common.mlp import MLP, ResidualMLP
+from speedaug.models.common.modules import SpatialEmb
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
@@ -62,11 +66,17 @@ class PARLDiffusionConfig(DiffusionConfig):
     q_target_clip_min: float = float("-inf")  # lower-clamp on Q target; -inf = no-op
     q_target_clip_max: float = float("inf")  # lower-clamp on Q target; -inf = no-op
 
+    # Q network type: "transformer" (cross-attending DiT) or "mlp" (SpatialEmb + MLP)
+    q_type: str = "transformer"
+
     # Q Transformer architecture (independent of policy DiT config)
     q_hidden_dim: int = 128
     q_n_heads: int = 4
     q_n_layers: int = 2
     q_dropout: float = 0.0
+
+    # MLP Q head hidden dims (used when q_type="mlp")
+    q_mlp_dims: tuple[int, ...] = (1024, 1024, 1024)
 
     # V network MLP hidden dims
     v_hidden_dims: tuple[int, ...] = (256, 256)
@@ -111,8 +121,16 @@ class TransformerQNetwork(nn.Module):
     ) -> None:
         super().__init__()
         assert hidden_dim % n_heads == 0, "hidden_dim must be divisible by n_heads"
-        self.state_encoder = nn.Linear(state_dim, hidden_dim)
-        self.action_encoder = nn.Linear(action_dim, hidden_dim)
+        self.state_encoder = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        self.action_encoder = nn.Sequential(
+            nn.Linear(action_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
         self.action_position_embedding = nn.Embedding(n_action_steps, hidden_dim)
         nn.init.normal_(self.action_position_embedding.weight, 0.0, 0.02)
 
@@ -154,24 +172,105 @@ class TransformerQNetwork(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# MLP Q network
+# ---------------------------------------------------------------------------
+
+class MLPQNetwork(nn.Module):
+    """
+    Q(encoder_tokens, state, action) → scalar.
+
+    Mirrors ViTCriticObsAct from speedaug:
+      - SpatialEmb compresses encoder patch tokens (conditioned on state) → spatial_emb vector
+      - Concat [spatial_emb | state | action_flat] → MLP/ResidualMLP head → scalar
+    """
+
+    def __init__(
+        self,
+        num_patch: int,
+        encoder_token_dim: int,
+        state_dim: int,
+        action_dim: int,
+        n_action_steps: int,
+        spatial_emb: int = 128,
+        mlp_dims: tuple[int, ...] = (256, 256),
+        dropout: float = 0.0,
+        activation_type: str = "Mish",
+        use_layernorm: bool = True,
+        residual_style: bool = True,
+    ) -> None:
+        super().__init__()
+        self.compress = SpatialEmb(
+            num_patch=num_patch,
+            patch_dim=encoder_token_dim,
+            prop_dim=state_dim,
+            proj_dim=spatial_emb,
+            dropout=dropout,
+        )
+        model = ResidualMLP if residual_style else MLP
+        q_in_dim = spatial_emb + state_dim + action_dim * n_action_steps
+        self.q_head = model(
+            [q_in_dim] + list(mlp_dims) + [1],
+            activation_type=activation_type,
+            out_activation_type="Identity",
+            use_layernorm=use_layernorm,
+        )
+
+    def forward(self, encoder_tokens: Tensor, state: Tensor, action: Tensor) -> Tensor:
+        """
+        encoder_tokens : (B, N, D)           patch tokens (N = n_obs_steps * n_cams * patches_per_img)
+        state          : (B, state_dim)       flattened obs state
+        action         : (B, T, action_dim)   n_action_steps actions
+        Returns        : (B,)                 Q values
+        """
+        feat = self.compress(encoder_tokens, state)       # (B, spatial_emb)
+        action_flat = action.view(action.shape[0], -1)    # (B, T*Da)
+        x = torch.cat([feat, state, action_flat], dim=-1)
+        return self.q_head(x).squeeze(-1)
+
+
+# ---------------------------------------------------------------------------
 # V network (MLP)
 # ---------------------------------------------------------------------------
 
 class VNetwork(nn.Module):
-    """V(state_flat, cls_tokens_flat) → scalar. MLP over their concatenation."""
+    """V(state_flat, cls_token) → scalar.
 
-    def __init__(self, obs_feat_dim: int, hidden_dims: tuple[int, ...] = (256, 256)) -> None:
+    Encodes state with a 2-layer MLP (mirrors Q-network state_encoder pattern),
+    concatenates with CLS token internally, then passes through an MLP head.
+    """
+
+    def __init__(
+        self,
+        state_dim: int,
+        cls_dim: int,
+        state_hidden_dim: int,
+        hidden_dims: tuple[int, ...] = (256, 256),
+    ) -> None:
         super().__init__()
-        layers: list[nn.Module] = []
-        d = obs_feat_dim
+        # State encoder: 2-layer MLP with LayerNorm (mirrors TransformerQNetwork.state_encoder)
+        self.state_encoder = nn.Sequential(
+            nn.Linear(state_dim, state_hidden_dim),
+            nn.GELU(),
+            nn.Linear(state_hidden_dim, state_hidden_dim),
+            nn.LayerNorm(state_hidden_dim),
+        )
+        # MLP head over [state_enc || cls_token]
+        d = state_hidden_dim + cls_dim
+        layers: list[nn.Module] = [nn.GELU()]
         for h in hidden_dims:
-            layers += [nn.Linear(d, h), nn.ReLU()]
+            layers += [nn.Linear(d, h), nn.LayerNorm(h), nn.GELU()]
             d = h
         layers.append(nn.Linear(d, 1))
         self.net = nn.Sequential(*layers)
 
-    def forward(self, obs_feat: Tensor) -> Tensor:
-        """obs_feat: (B, obs_feat_dim)  →  (B,)"""
+    def forward(self, state_flat: Tensor, cls_token: Tensor) -> Tensor:
+        """
+        state_flat : (B, state_dim)
+        cls_token  : (B, cls_dim)
+        Returns    : (B,)
+        """
+        state_enc = self.state_encoder(state_flat)
+        obs_feat = torch.cat([state_enc, cls_token], dim=-1)
         return self.net(obs_feat).squeeze(-1)
 
 
@@ -248,24 +347,39 @@ class PARLDiffusionPolicy(DiffusionPolicy):
         cls_dim = encoder_token_dim  # CLS token has same dim as patch tokens
 
         pcfg = self.config
-        self.critic_q = TransformerQNetwork(
-            encoder_token_dim=encoder_token_dim,
-            state_dim=state_dim,
-            action_dim=self._action_dim,
-            n_action_steps=self._n_act,
-            hidden_dim=pcfg.q_hidden_dim,
-            n_heads=pcfg.q_n_heads,
-            n_layers=pcfg.q_n_layers,
-            dropout=pcfg.q_dropout,
-        )
+        if pcfg.q_type == "mlp":
+            enc = self.diffusion.rgb_encoder
+            patches_per_image = (enc.IMG_SIZE // enc.backbone.patch_size) ** 2
+            num_patch = patches_per_image * self._n_obs_steps * self._n_cams
+            self.critic_q = MLPQNetwork(
+                num_patch=num_patch,
+                encoder_token_dim=encoder_token_dim,
+                state_dim=state_dim,
+                action_dim=self._action_dim,
+                n_action_steps=self._n_act,
+                spatial_emb=pcfg.q_hidden_dim,
+                mlp_dims=pcfg.q_mlp_dims,
+                dropout=pcfg.q_dropout,
+            )
+        else:
+            self.critic_q = TransformerQNetwork(
+                encoder_token_dim=encoder_token_dim,
+                state_dim=state_dim,
+                action_dim=self._action_dim,
+                n_action_steps=self._n_act,
+                hidden_dim=pcfg.q_hidden_dim,
+                n_heads=pcfg.q_n_heads,
+                n_layers=pcfg.q_n_layers,
+                dropout=pcfg.q_dropout,
+            )
 
         if not pcfg.inference_only:
             self.critic_target_q = copy.deepcopy(self.critic_q)
             self.critic_target_q.requires_grad_(False)
             self.critic_target_q.eval()   # dropout must be off for stable targets
 
-            v_in_dim = state_dim + cls_dim * self._n_obs_steps * self._n_cams
-            self.critic_v = VNetwork(v_in_dim, pcfg.v_hidden_dims)
+            total_cls_dim = cls_dim * self._n_obs_steps * self._n_cams
+            self.critic_v = VNetwork(state_dim, total_cls_dim, pcfg.q_hidden_dim, pcfg.v_hidden_dims)
 
         # Frozen pretrained UNet for high-noise steps (t >= num_ft_train_steps).
         # Snapshotted from the base checkpoint before any fine-tuning begins.
@@ -306,9 +420,44 @@ class PARLDiffusionPolicy(DiffusionPolicy):
         as a plain DiffusionPolicy (type: diffusion). PARL-specific fields (inference_only,
         n_samples, etc.) use their dataclass defaults unless overridden via --policy.XX.
         strict=False (the default) handles the missing critic keys from a base checkpoint.
+
+        Re-snapshots pretrained_unet from diffusion.unet only when loading from a base
+        DiffusionPolicy checkpoint (no pretrained_unet.* keys present). The deepcopy in
+        __init__ runs before checkpoint weights are loaded (diffusion.unet is still random
+        at that point), so the re-snapshot is needed to capture the correct pretrained weights.
+
+        When resuming from a fine-tuned PARL checkpoint, pretrained_unet.* keys are present
+        and already loaded correctly by super().from_pretrained(), so no re-snapshot occurs.
         """
         kwargs.setdefault("config_cls", PARLDiffusionConfig)
-        return super().from_pretrained(pretrained_name_or_path, **kwargs)
+        is_parl_ckpt = cls._checkpoint_has_pretrained_unet(pretrained_name_or_path)
+        policy = super().from_pretrained(pretrained_name_or_path, **kwargs)
+        if not is_parl_ckpt:
+            policy.pretrained_unet = copy.deepcopy(policy.diffusion.unet)
+            policy.pretrained_unet.requires_grad_(False)
+            policy.pretrained_unet.eval()
+        return policy
+
+    @classmethod
+    def _checkpoint_has_pretrained_unet(cls, pretrained_name_or_path) -> bool:
+        """Return True if the safetensors checkpoint contains pretrained_unet.* keys.
+
+        Reads only the safetensors header (no tensor data loaded). Returns False for
+        HuggingFace Hub paths (treated as base checkpoints) or on any I/O error.
+        """
+        import os
+        from safetensors import safe_open
+        from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
+
+        model_id = str(pretrained_name_or_path)
+        if not os.path.isdir(model_id):
+            return False  # Hub path: assume base checkpoint
+        model_file = os.path.join(model_id, SAFETENSORS_SINGLE_FILE)
+        try:
+            with safe_open(model_file, framework="pt", device="cpu") as f:
+                return any(k.startswith("pretrained_unet.") for k in f.keys())
+        except Exception:
+            return False
 
     # ------------------------------------------------------------------
     # Obs encoding
@@ -404,8 +553,10 @@ class PARLDiffusionPolicy(DiffusionPolicy):
 
         encoder_tokens, state_flat, _ = self.encode_obs(batch)  # CLS not needed for Q scoring
 
-        obs_n = _expand_obs(batch, n_samples)
-        global_cond_n = dm._prepare_global_conditioning(obs_n)
+        assert "adv_cond" not in batch, "_sample_and_select does not support advantage conditioning"
+        encoder_tokens_n = encoder_tokens.repeat(n_samples, *((1,) * (encoder_tokens.dim() - 1)))
+        state_flat_n = state_flat.repeat(n_samples, 1)
+        global_cond_n = {"encoder_tokens": encoder_tokens_n, "state": state_flat_n}
         action_cond_n = (
             action_cond.repeat(n_samples, *((1,) * (action_cond.dim() - 1)))
             if action_cond is not None else None
@@ -483,7 +634,6 @@ class PARLDiffusionPolicy(DiffusionPolicy):
         with torch.no_grad():
             encoder_tokens, state_flat, cls_tokens_flat = self.encode_obs(obs)
 
-        v_feat = torch.cat([state_flat, cls_tokens_flat], dim=-1)  # (B, v_in_dim)
         action = batch[ACTION][:, :self._n_act]                    # (B, n_act, Da)
 
         # Gamma-discounted H-step return: G = Σ_{t=0}^{H-1} γ^t * r_t  →  (B,)
@@ -492,7 +642,14 @@ class PARLDiffusionPolicy(DiffusionPolicy):
         gamma_weights = pcfg.gamma ** torch.arange(
             self._horizon, device=reward_seq.device, dtype=reward_seq.dtype
         )                                                           # (H,)
-        reward = (reward_seq * gamma_weights).sum(dim=-1)          # (B,)
+
+        # Mask padded steps; real_h = number of valid reward timesteps per sample
+        reward_is_pad = batch.get("reward_is_pad")                 # (B, H) bool or None
+        valid_mask = (~reward_is_pad.to(reward_seq.device) if reward_is_pad is not None
+                      else torch.ones(B, self._horizon, device=reward_seq.device, dtype=torch.bool))
+        real_h = valid_mask.sum(dim=-1)                            # (B,)
+        reward = (reward_seq * gamma_weights * valid_mask).sum(dim=-1)  # (B,)
+        assert reward.shape == (B, )
 
         # terminated at step H: (B, 1, 1) → (B,)
         terminated_raw = batch.get(pcfg.terminated_key)
@@ -501,11 +658,13 @@ class PARLDiffusionPolicy(DiffusionPolicy):
             if terminated_raw is not None
             else torch.zeros(B, device=reward.device, dtype=reward.dtype)
         )
+        assert terminated.shape == (B, )
 
         # V loss: expectile regression against frozen target Q
         with torch.no_grad():
             q_ref = self.critic_target_q(encoder_tokens, state_flat, action)  # (B,)
-        v = self.critic_v(v_feat)                                              # (B,)
+        v = self.critic_v(state_flat, cls_tokens_flat)                         # (B,)
+        assert q_ref.shape == v.shape
         diffs = q_ref - v
         weights = torch.where(diffs > 0, pcfg.expectile, 1.0 - pcfg.expectile)
         v_loss = (weights * diffs.pow(2)).mean()
@@ -514,14 +673,15 @@ class PARLDiffusionPolicy(DiffusionPolicy):
         next_obs = self._build_next_obs_batch(batch)
         with torch.no_grad():
             _, next_state_flat, next_cls_flat = self.encode_obs(next_obs)
-            next_v_feat = torch.cat([next_state_flat, next_cls_flat], dim=-1)
-            next_v = self.critic_v(next_v_feat)                                # (B,)
-        gamma_H = pcfg.gamma ** self._horizon
+            next_v = self.critic_v(next_state_flat, next_cls_flat)             # (B,)
+            assert next_v.shape == (B, )
+        gamma_H = pcfg.gamma ** real_h                             # (B,)
         q_target = (reward + gamma_H * (1.0 - terminated) * next_v).clamp(
             min=pcfg.q_target_clip_min, max=pcfg.q_target_clip_max
         )
 
         q = self.critic_q(encoder_tokens, state_flat, action)                  # (B,)
+        assert q.shape == (B, )
         q_loss = F.mse_loss(q, q_target.detach())
 
         stats = {
@@ -538,8 +698,7 @@ class PARLDiffusionPolicy(DiffusionPolicy):
         Expects batch["next.observation.state"] with shape (B, 1, state_dim) and,
         for image policies, batch["next.observation.images.*"] with shape (B, 1, C, H, W).
         These are produced by LeRobotDataset when delta_timestamps includes "next.*" keys
-        with a delta of n_action_steps / fps.  Terminal frames must be excluded via
-        drop_n_last_frames = n_action_steps in FTConfig.
+        with a delta of n_action_steps / fps.
         """
         pcfg = self.config
         next_obs: dict[str, Tensor] = {OBS_STATE: batch[pcfg.next_obs_state_key]}
@@ -549,7 +708,7 @@ class PARLDiffusionPolicy(DiffusionPolicy):
             remapped = {
                 k.replace(pcfg.next_obs_image_prefix, "observation.images"): batch[k]
                 for k in next_img_keys
-            }
+        }
             next_obs[OBS_IMAGES] = torch.stack(
                 [remapped[k] for k in self.config.image_features], dim=-4
             )
@@ -575,12 +734,17 @@ class PARLDiffusionPolicy(DiffusionPolicy):
         B = batch[ACTION].shape[0]
         device = next(self.parameters()).device
 
-        # Sample from ft_diffusion and Q-score (all no grad)
+        assert "adv_cond" not in batch, "actor_loss does not support advantage conditioning"
+
+        # Sample from self.diffusion and Q-score (all no grad).
+        # Reuse encoder_tokens from encode_obs for both sampling and Q-scoring to avoid
+        # running the rgb_encoder twice and to keep conditioning consistent.
         with torch.no_grad():
             encoder_tokens, state_flat, _ = self.encode_obs(obs)
-            obs_n = _expand_obs(obs, n)
-            global_cond_n = ft_diffusion._prepare_global_conditioning(obs_n)
-            sampled = ft_diffusion.conditional_sample(                 # (n*B, H, Da)
+            encoder_tokens_n = encoder_tokens.repeat(n, *((1,) * (encoder_tokens.dim() - 1)))
+            state_flat_n = state_flat.repeat(n, 1)
+            global_cond_n = {"encoder_tokens": encoder_tokens_n, "state": state_flat_n}
+            sampled = ft_diffusion.conditional_sample(             # (n*B, H, Da)
                 n * B, global_cond=global_cond_n,
                 pretrained_unet=pretrained_unet,
                 num_ft_train_steps=num_ft_train_steps,
@@ -590,8 +754,7 @@ class PARLDiffusionPolicy(DiffusionPolicy):
             q_scores = self._q_score_samples(encoder_tokens, state_flat, sampled)  # (n, B)
             best_action = self._select_best(sampled, q_scores)                      # (B, H, Da)
 
-        # BC loss — grad flows through self.diffusion.compute_loss
-        #    → _prepare_global_conditioning → rgb_encoder
+        # BC loss — grad flows through self.diffusion.compute_loss → rgb_encoder
         # Restrict to t < num_ft_train_steps so self.unet is only trained on the steps
         # it will actually handle at inference (pretrained_unet covers the rest).
         bc_batch = dict(obs)
@@ -604,12 +767,20 @@ class PARLDiffusionPolicy(DiffusionPolicy):
             max_timestep=num_ft_train_steps if num_ft_train_steps > 0 else None,
         )
 
+        if pcfg.distil_temp > 0:
+            probs = F.softmax(q_scores / pcfg.distil_temp, dim=0)  # (n, B)
+            ent = -(probs * probs.clamp(min=1e-8).log()).sum(0)
+            q_ent_global = (ent / math.log(max(n, 2))).mean().item()
+        else:
+            q_ent_global = 0.0
+
         stats = {
             "actor_loss": actor_loss.item(),
             "q_best_mean": q_scores.max(dim=0).values.mean().item(),
             "q_spread_mean": (
                 q_scores.max(dim=0).values - q_scores.min(dim=0).values
             ).mean().item(),
+            "q_ent_global": q_ent_global,
         }
         return actor_loss, stats
 
