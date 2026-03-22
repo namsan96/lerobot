@@ -193,6 +193,12 @@ class RobotClientConfig:
     dataset_resume: bool = field(
         default=False, metadata={"help": "If True, resume recording into an existing dataset instead of creating a new one."}
     )
+    dataset_data_files_size_in_mb: int | None = field(
+        default=None, metadata={"help": "Maximum size in MB for each parquet data file before starting a new one."}
+    )
+    dataset_video_files_size_in_mb: int | None = field(
+        default=None, metadata={"help": "Maximum size in MB for each video file before starting a new one."}
+    )
 
     # EE action space — mirrors DiffusionConfig.ee_action_space.
     # "joint_pos": policy outputs joint positions directly (default, identity pipeline).

@@ -158,6 +158,8 @@ class RobotClient:
                     use_videos=config.dataset_video,
                     image_writer_processes=config.dataset_num_image_writer_processes,
                     image_writer_threads=config.dataset_num_image_writer_threads_per_camera * num_cameras,
+                    data_files_size_in_mb=config.dataset_data_files_size_in_mb,
+                    video_files_size_in_mb=config.dataset_video_files_size_in_mb,
                 )
 
         # FPS measurement
@@ -218,10 +220,10 @@ class RobotClient:
         try:
             termios.tcflush(sys.stdin, termios.TCIFLUSH)
             while True:
-                val = input("Terminated? (0=False, 1=True): ").strip()
-                if val in ("0", "1"):
+                val = input("Terminated? (0=False, 1=True, -1=Cancel episode): ").strip()
+                if val in ("-1", "0", "1"):
                     return float(val)
-                print("Please enter 0 or 1.")
+                print("Please enter -1, 0, or 1.")
         finally:
             self._restart_keyboard_listener()
 
@@ -592,13 +594,17 @@ class RobotClient:
                     self._wait_for_enter("Enter to start next episode")
                 else:
                     terminated = self._prompt_terminated()
-                    self.dataset.episode_buffer["terminated"][-1] = np.array([terminated], dtype=np.float32)
-                    self.dataset.save_episode()
-                    # Close data parquet writer so ft_learner (separate process) can read the file.
-                    # _writer_closed_for_reading tells _save_episode_data to open a new file next episode.
-                    self.dataset._close_writer()
-                    self.dataset._writer_closed_for_reading = True
-                    self.logger.info(f"Episode {self.dataset.num_episodes} saved with terminated={bool(terminated)}")
+                    if terminated == -1.0:
+                        self.logger.info("Episode cancelled, discarding episode buffer")
+                        self.dataset.clear_episode_buffer()
+                    else:
+                        self.dataset.episode_buffer["terminated"][-1] = np.array([terminated], dtype=np.float32)
+                        self.dataset.save_episode()
+                        # Close data parquet writer so ft_learner (separate process) can read the file.
+                        # _writer_closed_for_reading tells _save_episode_data to open a new file next episode.
+                        self.dataset._close_writer()
+                        self.dataset._writer_closed_for_reading = True
+                        self.logger.info(f"Episode {self.dataset.num_episodes} saved with terminated={bool(terminated)}")
                     self._wait_for_enter("Enter to start next episode")
             else:
                 self._wait_for_enter("Enter to restart")

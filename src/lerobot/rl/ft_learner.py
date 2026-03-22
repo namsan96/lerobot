@@ -21,8 +21,10 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+from lerobot.configs.default import DatasetConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.sampler import EpisodeAwareSampler
+from lerobot.datasets.transforms import ImageTransforms
 from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 from lerobot.rl.algorithm import Algorithm, AlgorithmConfig  # noqa: F401 — re-exported for back-compat
 from lerobot.rl.parl_bc import PARLBCConfig  # default algorithm; registers "parl_bc" subclass
@@ -35,15 +37,17 @@ class FTConfig:
     pretrained_name_or_path: str                  # HF hub id or local path
     policy_type: str                              # "diffusion", "act", "pi0", etc.
 
-    # Dataset
-    dataset_repo_id: str                          # repo_id for LeRobotDataset (e.g. "user/dataset")
-    dataset_root: str | None = None               # local path; defaults to HF_LEROBOT_HOME/dataset_repo_id
-    delta_timestamps: dict | None = None          # auto-resolved from policy config if None
+    # Dataset — all --dataset.XX options (repo_id, root, image_transforms, drop_cameras, etc.)
+    dataset: DatasetConfig
+
+    # delta_timestamps: auto-resolved from policy config if None (ft-specific, not in DatasetConfig)
+    delta_timestamps: dict | None = None
 
     # Training
     device: str = "cuda"
     batch_size: int = 64
     num_workers: int = 4
+    prefetch_factor: int | None = None
     grad_clip_norm: float = 1.0
 
     # Minimum frames on disk before training starts (blocking wait)
@@ -66,11 +70,6 @@ class FTConfig:
     # Algorithm config — fields map to PARLBCConfig by default (e.g. --alg.actor_lr=1e-4).
     # Override the concrete type with --alg.type=<registered_name> for other algorithms.
     alg: PARLBCConfig = field(default_factory=PARLBCConfig)
-
-    def __post_init__(self):
-        if self.dataset_root is None:
-            from lerobot.utils.constants import HF_LEROBOT_HOME
-            self.dataset_root = str(HF_LEROBOT_HOME / self.dataset_repo_id)
 
     # Policy CLI overrides (--policy.xxx, injected by __main__ before train())
     policy_cli_overrides: list[str] = field(default_factory=list)
@@ -103,31 +102,59 @@ def _read_total_episodes(dataset_root: Path) -> int:
 
 
 def _make_dataloader(dataset: LeRobotDataset, cfg: FTConfig) -> DataLoader:
+    import math
+    import torch.utils.data
     sampler = EpisodeAwareSampler(
         dataset.meta.episodes["dataset_from_index"],
         dataset.meta.episodes["dataset_to_index"],
         drop_n_last_frames=cfg.drop_n_last_frames,
         shuffle=True,
     )
+    # Repeat indices so one epoch covers at least num_workers * prefetch_factor batches,
+    # keeping workers busy across the full training update without hitting epoch boundaries.
+    indices = list(sampler)
+    min_samples = cfg.num_workers * (cfg.prefetch_factor or 2) * cfg.batch_size
+    n_repeats = max(1, math.ceil(min_samples / max(len(indices), 1)))
+    if n_repeats > 1:
+        indices = indices * n_repeats
+    effective_sampler = torch.utils.data.SubsetRandomSampler(indices)
     return DataLoader(
         dataset,
         batch_size=cfg.batch_size,
-        sampler=sampler,
+        sampler=effective_sampler,
         num_workers=cfg.num_workers,
+        prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
         pin_memory=cfg.device != "cpu",
         drop_last=True,
+        persistent_workers=cfg.num_workers > 0,
     )
 
 
-def _dataset_repo_id(cfg: FTConfig) -> str:
-    return cfg.dataset_repo_id
-
-
 def _load_dataset(cfg: FTConfig) -> LeRobotDataset:
+    from torchvision.transforms import v2
+    transforms = []
+    if cfg.dataset.load_image_size is not None:
+        transforms.append(v2.Resize(cfg.dataset.load_image_size, antialias=True))
+    if cfg.dataset.image_transforms.enable:
+        transforms.append(ImageTransforms(cfg.dataset.image_transforms))
+    image_transforms = v2.Compose(transforms) if transforms else None
+
+    if cfg.dataset.image_predecode:
+        from lerobot.utils.constants import HF_LEROBOT_HOME
+        from lerobot.scripts.predecode_videos import predecode_videos
+        dataset_root = Path(cfg.dataset.root) if cfg.dataset.root else HF_LEROBOT_HOME / cfg.dataset.repo_id
+        predecode_videos(dataset_root=dataset_root, repo_id=cfg.dataset.repo_id, num_workers=1, size=cfg.dataset.predecode_size)
+
     return LeRobotDataset(
-        _dataset_repo_id(cfg),
-        root=Path(cfg.dataset_root),
+        cfg.dataset.repo_id,
+        root=cfg.dataset.root,
         delta_timestamps=cfg.delta_timestamps,
+        image_transforms=image_transforms,
+        video_backend=cfg.dataset.video_backend,
+        revision=cfg.dataset.revision,
+        episodes=cfg.dataset.episodes,
+        drop_cameras=cfg.dataset.drop_cameras,
+        image_predecode=cfg.dataset.image_predecode,
     )
 
 
@@ -172,16 +199,22 @@ def train(
     """
     device = get_safe_torch_device(cfg.device)
     output_dir = Path(cfg.output_dir)
-    dataset_root = Path(cfg.dataset_root)
+    from lerobot.utils.constants import HF_LEROBOT_HOME
+    dataset_root = Path(cfg.dataset.root) if cfg.dataset.root else HF_LEROBOT_HOME / cfg.dataset.repo_id
 
     policy = make_policy(cfg, policy_cli_overrides=cfg.policy_cli_overrides)
     policy.to(device)
     policy.train()
 
-    if cfg.drop_n_last_frames == 0:
-        cfg.drop_n_last_frames = getattr(policy.config, "horizon", 0)
+    latest_weights = output_dir / "latest_weights.pt"
+    if latest_weights.exists():
+        policy.load_state_dict(torch.load(latest_weights, map_location=device))
+        logging.info(f"[FT_LEARNER] Resumed weights from {latest_weights}")
 
-    algorithm = algorithm_cls(policy)
+    # if cfg.drop_n_last_frames == 0:
+    #     cfg.drop_n_last_frames = getattr(policy.config, "horizon", 0)
+
+    algorithm = algorithm_cls(policy, output_dir=output_dir)
 
     # ---- Block until enough frames are on disk ----
     while True:
@@ -302,10 +335,16 @@ def serve(cfg: FTConfig):
         python -m lerobot.rl.ft_learner \\
             --pretrained_name_or_path=tw_outputs/diffusion/pretrained_model \\
             --policy_type=diffusion \\
-            --dataset_root=/data/recordings/pick_and_place \\
+            --dataset.repo_id=user/pick_and_place \\
+            --dataset.root=/data/recordings/pick_and_place \\
+            --dataset.load_image_size="(224,224)" \\
+            --dataset.drop_cameras="[observation.images.left]" \\
+            --dataset.image_transforms.enable=true \\
+            --dataset.image_transforms.tfs.rgb_shuffle.weight=1 \\
             --device=cuda \\
             --batch_size=64 \\
             --num_workers=4 \\
+            --prefetch_factor=4 \\
             --min_frames_before_training=500 \\
             --env_steps_per_itr=100 \\
             --weight_push_freq_itr=5 \\

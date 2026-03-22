@@ -42,6 +42,12 @@ class DatasetConfig:
     cache_video_resize: tuple[int, int] | None = None
     # Camera keys to exclude from loading (e.g. ["observation.images.side"]).
     drop_cameras: list[str] = field(default_factory=list)
+    # Resize images to (H, W) inside the DataLoader worker, before batching. Reduces memory and IPC cost.
+    load_image_size: int | tuple[int, int] | None = None
+    # Load frames from pre-decoded PNG files instead of decoding video on the fly.
+    # Set image_predecode=true to enable; predecode_size controls the saved resolution.
+    image_predecode: bool = False
+    predecode_size: int | tuple[int, int] | None = None  # (H, W) or single int for square
 
 
 @dataclass

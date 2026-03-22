@@ -29,6 +29,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 import torch.utils
+import torchvision.io
 from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.errors import RevisionNotFoundError
 
@@ -579,6 +580,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         cache_videos: bool = False,
         cache_video_resize: tuple[int, int] | None = None,
         drop_cameras: list[str] | None = None,
+        image_predecode: bool = False,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -711,6 +713,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.batch_encoding_size = batch_encoding_size
         self.cache_videos = cache_videos
         self.cache_video_resize = cache_video_resize
+        self.image_predecode = image_predecode
         self.episodes_since_last_encoding = 0
 
         # Unused attributes
@@ -1052,6 +1055,25 @@ class LeRobotDataset(torch.utils.data.Dataset):
             # shift the query timestamp accordingly.
             # Support "next.<vid_key>" aliases: resolve to the underlying video file.
             src_vid_key = vid_key[len("next."):] if vid_key.startswith("next.") and vid_key not in self.meta.video_keys else vid_key
+
+            # Image fast-path: when pre-decoded PNGs are available, load directly without video decoding.
+            if self.image_predecode:
+                image_dir = (
+                    self.root
+                    / DEFAULT_IMAGE_PATH.format(
+                        image_key=src_vid_key,
+                        episode_index=ep_idx,
+                        frame_index=0,
+                    )
+                ).parent
+                frame_tensors = []
+                for ts in query_ts:
+                    frame_index = round(ts * self.meta.fps)
+                    frame_path = image_dir / f"frame-{frame_index:06d}.png"
+                    frame_tensors.append(torchvision.io.read_image(str(frame_path)).float() / 255.0)
+                item[vid_key] = torch.stack(frame_tensors)
+                continue
+
             from_timestamp = ep[f"videos/{src_vid_key}/from_timestamp"]
             shifted_query_ts = [from_timestamp + ts for ts in query_ts]
 
