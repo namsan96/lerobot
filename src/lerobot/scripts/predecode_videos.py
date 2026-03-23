@@ -24,6 +24,7 @@ Usage:
 
 import argparse
 import logging
+from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
@@ -63,8 +64,10 @@ def _decode_episode(
     )
     episode_dir = first_frame_path.parent
 
-    # Skip if all frames already exist
+    # Skip if all frames already exist; clean up any leftover .tmp files from prior interrupted runs.
     if episode_dir.exists():
+        for tmp in episode_dir.glob("frame-*.tmp"):
+            tmp.unlink()
         existing = list(episode_dir.glob("frame-*.png"))
         if len(existing) == n_frames:
             return f"episode {ep_idx}/{total_episodes - 1}: skipped (already decoded)"
@@ -78,12 +81,45 @@ def _decode_episode(
     episode_dir.mkdir(parents=True, exist_ok=True)
     for i in range(n_frames):
         frame_path = episode_dir / f"frame-{i:06d}.png"
+        tmp_path = frame_path.with_suffix(".tmp")
         img = PIL.Image.fromarray(frames[i].permute(1, 2, 0).mul(255).clamp(0, 255).byte().numpy())
         if size is not None:
             img = img.resize((size[1], size[0]), PIL.Image.LANCZOS)  # PIL uses (W, H)
-        img.save(frame_path)
+        img.save(tmp_path, format="PNG")
+        tmp_path.rename(frame_path)
 
     return f"episode {ep_idx}/{total_episodes - 1}: decoded {n_frames} frames"
+
+
+def _decode_video_group(
+    vid_key: str,
+    video_path: str,
+    episodes: list[dict],
+    total_episodes: int,
+    dataset_root: str,
+    fps: int,
+    size: tuple[int, int] | None = None,
+) -> list[str]:
+    """Process all episodes for a single (video_path, vid_key) pair sequentially.
+
+    Episodes are sorted by from_timestamp so the decoder makes one forward pass
+    through the file with no backward seeks between episodes.
+    """
+    episodes = sorted(episodes, key=lambda x: x["ep"][f"videos/{vid_key}/from_timestamp"])
+    results = []
+    for item in episodes:
+        result = _decode_episode(
+            ep_idx=item["ep_idx"],
+            total_episodes=total_episodes,
+            ep=item["ep"],
+            vid_key=vid_key,
+            dataset_root=dataset_root,
+            fps=fps,
+            video_path=video_path,
+            size=size,
+        )
+        results.append((item["ep_idx"], result))
+    return results
 
 
 def predecode_videos(dataset_root: str | Path, repo_id: str, num_workers: int = 4, size: int | tuple[int, int] | None = None) -> None:
@@ -101,60 +137,64 @@ def predecode_videos(dataset_root: str | Path, repo_id: str, num_workers: int = 
         logger.info("No video keys found in dataset metadata. Nothing to decode.")
         return
 
-    # Build list of (ep_idx, vid_key) tasks
-    tasks = []
+    # Group episodes by (video_path, vid_key) so each worker makes one sequential
+    # forward pass through a video file instead of seeking independently per episode.
+    groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
     for ep_idx in range(total_episodes):
         ep = meta.episodes[ep_idx]
         for vid_key in video_keys:
-            video_path = dataset_root / meta.get_video_file_path(ep_idx, vid_key)
-            tasks.append((ep_idx, ep, vid_key, video_path))
+            video_path = str(dataset_root / meta.get_video_file_path(ep_idx, vid_key))
+            groups[(video_path, vid_key)].append({"ep_idx": ep_idx, "ep": ep})
 
-    num_workers = min(num_workers, len(tasks))
+    grouped_tasks = [(vid_key, video_path, episodes) for (video_path, vid_key), episodes in groups.items()]
+
+    num_workers = min(num_workers, len(grouped_tasks))
     logger.info(
-        "Pre-decoding %d episode×video-key combinations with %d workers.",
-        len(tasks),
+        "Pre-decoding %d video-file×video-key groups (%d episodes total) with %d workers.",
+        len(grouped_tasks),
+        total_episodes * len(video_keys),
         num_workers,
     )
 
     if num_workers <= 1:
-        for ep_idx, ep, vid_key, video_path in tasks:
-            result = _decode_episode(
-                ep_idx=ep_idx,
-                total_episodes=total_episodes,
-                ep=ep,
+        for vid_key, video_path, episodes in grouped_tasks:
+            results = _decode_video_group(
                 vid_key=vid_key,
+                video_path=video_path,
+                episodes=episodes,
+                total_episodes=total_episodes,
                 dataset_root=str(dataset_root),
                 fps=fps,
-                video_path=str(video_path),
                 size=size,
             )
-            logger.info("%s [vid_key=%s]", result, vid_key)
+            for ep_idx, result in results:
+                logger.info("%s [vid_key=%s]", result, vid_key)
     else:
         futures = {}
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            for ep_idx, ep, vid_key, video_path in tasks:
+            for vid_key, video_path, episodes in grouped_tasks:
                 future = executor.submit(
-                    _decode_episode,
-                    ep_idx=ep_idx,
-                    total_episodes=total_episodes,
-                    ep=ep,
+                    _decode_video_group,
                     vid_key=vid_key,
+                    video_path=video_path,
+                    episodes=episodes,
+                    total_episodes=total_episodes,
                     dataset_root=str(dataset_root),
                     fps=fps,
-                    video_path=str(video_path),
                     size=size,
                 )
-                futures[future] = (ep_idx, vid_key)
+                futures[future] = (video_path, vid_key)
 
             for future in as_completed(futures):
-                ep_idx, vid_key = futures[future]
+                video_path, vid_key = futures[future]
                 try:
-                    result = future.result()
-                    logger.info("%s [vid_key=%s]", result, vid_key)
+                    results = future.result()
+                    for ep_idx, result in results:
+                        logger.info("%s [vid_key=%s]", result, vid_key)
                 except Exception as exc:
                     logger.error(
-                        "episode %d vid_key=%s raised an exception: %s",
-                        ep_idx,
+                        "video_path=%s vid_key=%s raised an exception: %s",
+                        video_path,
                         vid_key,
                         exc,
                     )

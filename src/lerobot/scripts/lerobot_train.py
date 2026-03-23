@@ -16,6 +16,7 @@
 import logging
 import time
 from contextlib import nullcontext
+from pathlib import Path
 from pprint import pformat
 from typing import Any
 
@@ -197,6 +198,20 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     # Dataset loading synchronization: main process downloads first to avoid race conditions
     if is_main_process:
+        if cfg.dataset.image_predecode:
+            from lerobot.utils.constants import HF_LEROBOT_HOME
+
+            from lerobot.scripts.predecode_videos import predecode_videos
+
+            dataset_root = Path(cfg.dataset.root) if cfg.dataset.root else HF_LEROBOT_HOME / cfg.dataset.repo_id
+            logging.info("Pre-decoding videos to PNG files...")
+            predecode_videos(
+                dataset_root=dataset_root,
+                repo_id=cfg.dataset.repo_id,
+                num_workers=cfg.num_workers,
+                size=cfg.dataset.predecode_size,
+            )
+
         logging.info("Creating dataset")
         dataset = make_dataset(cfg)
 
