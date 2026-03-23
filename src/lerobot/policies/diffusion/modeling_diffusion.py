@@ -149,8 +149,8 @@ class DiffusionPolicy(PreTrainedPolicy):
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
-        if self.config.speedaug:
-            batch = self.diffusion._apply_speed_augmentation(batch)
+        # if self.config.speedaug:
+        #     batch = self.diffusion._apply_speed_augmentation(batch)
         loss = self.diffusion.compute_loss(batch)
         # no output_dict so returning None
         return loss, None
@@ -458,23 +458,40 @@ class DiffusionModel(nn.Module):
 
         return actions
 
-    def _apply_speed_augmentation(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+    def _apply_speed_augmentation(self, actions, d: torch.Tensor | None = None):
         """Downsample the long action sequence (horizon * speedup_factor) to (horizon,).
 
         For each batch element, samples v ~ Uniform(1, speedup_factor) and linearly
-        interpolates into the long sequence at positions v * [1, ..., horizon] - 1.
+        interpolates into the long sequence at positions cumsum(v_per_step) - 1.
+
+        When `d` is provided (shape (B,) int tensor), applies two-part augmentation:
+          - steps [0, d):  speed v1 ~ Uniform(1, speedup_factor)
+          - steps [d, H):  speed v2 ~ clamp(v1 + Uniform(-1, 1), 1, speedup_factor)
+        The per-step speed vector [v1,...,v1, v2,...,v2] is cumsum'd to get source
+        indices, which naturally avoids abrupt jumps at the split boundary.
         """
-        actions = batch[ACTION]  # (B, H_long, action_dim)
+        # actions = batch[ACTION]  # (B, H_long, action_dim)
         B, H_long, action_dim = actions.shape
         H = self.config.horizon
         device = actions.device
 
-        # Sample per-element speed: v ~ Uniform(1, speedup_factor)
-        v = 1.0 + (self.config.speedup_factor - 1.0) * torch.rand(B, device=device)  # (B,)
+        if d is None:
+            # Single speed for the whole sequence: speeds[b, h] = v[b] for all h.
+            v = 1.0 + (self.config.speedup_factor - 1.0) * torch.rand(B, device=device)  # (B,)
+            speeds = v[:, None].expand(B, H)  # (B, H)
+        else:
+            # Two-part speed: v1 for [0, d), v2 for [d, H).
+            v1 = 1.0 + (self.config.speedup_factor - 1.0) * torch.rand(B, device=device)
+            v2_min = (v1 - 1.0).clamp(min=1.0)
+            v2_max = (v1 + 1.0).clamp(max=self.config.speedup_factor)
+            u = torch.rand(B, device=device)
+            v2 = v2_min + u * (v2_max - v2_min)
 
-        # Fractional source indices: ffw_indices[b, t] = v[b] * (t+1) - 1 for t in [0, H)
-        step_indices = torch.arange(1, H + 1, dtype=torch.float32, device=device)  # (H,)
-        ffw_indices = v[:, None] * step_indices[None, :] - 1  # (B, H)
+            h_range = torch.arange(H, device=device).unsqueeze(0)  # (1, H)
+            speeds = torch.where(h_range < d.unsqueeze(1), v1.unsqueeze(1), v2.unsqueeze(1))  # (B, H)
+
+        # Source indices via cumulative sum: ffw_indices[b, h] = sum(speeds[b, 0..h]) - 1
+        ffw_indices = speeds.cumsum(dim=1) - 1  # (B, H)
         ffw_indices = ffw_indices.clamp(0, H_long - 1)
 
         # Linear interpolation via floor/ceil gather
@@ -487,8 +504,8 @@ class DiffusionModel(nn.Module):
         ceil_actions = actions.gather(1, expand(ceil_idx))    # (B, H, action_dim)
         downsampled_actions = (1 - frac) * floor_actions + frac * ceil_actions
 
-        batch = dict(batch)
-        batch[ACTION] = downsampled_actions
+        # batch = dict(batch)
+        # batch[ACTION] = downsampled_actions
 
         assert self.config.do_mask_loss_for_padding == False
         # didnt check this logic
@@ -496,7 +513,7 @@ class DiffusionModel(nn.Module):
         #     is_pad = batch["action_is_pad"]  # (B, H_long), bool
         #     batch["action_is_pad"] = is_pad.gather(1, floor_idx) | is_pad.gather(1, ceil_idx)
 
-        return batch
+        return downsampled_actions
 
     def compute_loss(self, batch: dict[str, Tensor], max_timestep: int | None = None) -> Tensor:
         """
@@ -523,6 +540,9 @@ class DiffusionModel(nn.Module):
         horizon = batch[ACTION].shape[1]
         assert horizon == self.config.horizon
         assert n_obs_steps == self.config.n_obs_steps
+
+        if self.config.speedaug:
+            raise NotImplementedError
 
         # Encode image features and concatenate them all together along with the state vector.
         global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
@@ -709,19 +729,18 @@ class FlowModel(DiffusionModel):
         assert OBS_IMAGES in batch or OBS_ENV_STATE in batch
         n_obs_steps = batch[OBS_STATE].shape[1]
         horizon = batch[ACTION].shape[1]
-        assert horizon == self.config.horizon
+        if self.config.speedaug:
+            assert horizon == self.config.horizon * self.config.speedup_factor
+        else:
+            assert horizon == self.config.horizon
         assert n_obs_steps == self.config.n_obs_steps
 
         # Encode image features and concatenate them all together along with the state vector.
         global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
-# Forward diffusion.
-        trajectory = batch[ACTION]
-        # Sample noise to add to the trajectory.
-        eps = torch.randn(trajectory.shape, device=trajectory.device)
 
-        B = trajectory.shape[0]
-        H = trajectory.shape[1]
-        device = trajectory.device
+        B = batch[ACTION].shape[0]
+        H = self.config.horizon  # _apply_speed_augmentation always outputs config.horizon steps
+        device = get_device_from_parameters(self)
 
         # max_timestep is in DDPM step convention [0, K).
         # For flow matching, fine-tuned steps are the last max_timestep denoising steps,
@@ -741,10 +760,6 @@ class FlowModel(DiffusionModel):
             t = tau_min + t * (1.0 - tau_min) / 0.999
             timesteps = t[:, None].expand(B, H).clone()  # (B, H)
 
-        noisy_trajectory = (1 - timesteps.unsqueeze(-1)) * eps + timesteps.unsqueeze(-1) * trajectory
-
-        vel = trajectory - eps
-
         if self.config.rtc_type == "train_time":
             d = torch.randint(0, self.config.rtc_delay, (B,), device=device)
             # mask[b, h] = True if h < d[b], shape (B, H)
@@ -752,6 +767,19 @@ class FlowModel(DiffusionModel):
             mask = h_idx < d.unsqueeze(1)  # (B, H)
             max_t = 1.0 if self.config.t_schedule is None else 0.999
             timesteps = timesteps.masked_fill(mask, max_t)
+            trajectory = self._apply_speed_augmentation(
+                batch[ACTION], d=d if self.config.speedaug else None
+            )
+        else:
+            trajectory = self._apply_speed_augmentation(batch[ACTION])
+
+        # Sample noise after trajectory is resolved.
+        eps = torch.randn(trajectory.shape, device=trajectory.device)
+
+        noisy_trajectory = (1 - timesteps.unsqueeze(-1)) * eps + timesteps.unsqueeze(-1) * trajectory
+        vel = trajectory - eps
+
+        if self.config.rtc_type == "train_time":  # inpainting
             noisy_trajectory = torch.where(mask.unsqueeze(-1).expand_as(trajectory), trajectory, noisy_trajectory)
 
         pred = self.unet(noisy_trajectory, timesteps, global_cond=global_cond)
