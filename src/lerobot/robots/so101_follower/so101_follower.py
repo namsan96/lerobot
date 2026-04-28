@@ -45,10 +45,10 @@ class SO101Follower(Robot):
     # Normalized home position (RANGE_M100_100 for body joints, RANGE_0_100 for gripper)
     HOME_POS: dict[str, float] = {
         "shoulder_pan": 0.0,
-        "shoulder_lift": -100.0,
+        "shoulder_lift": -85.0,
         "elbow_flex": 100.0,
         "wrist_flex": 40.0,
-        "wrist_roll": 0.0,
+        "wrist_roll": -20.0,
         "gripper": 50.0,
     }
 
@@ -171,6 +171,10 @@ class SO101Follower(Robot):
                 self.bus.write("I_Coefficient", motor, I)
                 self.bus.write("D_Coefficient", motor, D)
 
+                if motor in ['shoulder_pan', 'shoulder_lift']:
+                    self.bus.write("CW_Dead_Zone", motor, 4)
+                    self.bus.write("CCW_Dead_Zone", motor, 4)
+
                 if motor == "gripper":
                     self.bus.write(
                         "Max_Torque_Limit", motor, 500
@@ -260,18 +264,23 @@ class SO101Follower(Robot):
 
         logger.info(f"Moving {self} to home position (acceleration={acceleration})...")
 
+        # Stop motors in place before changing acceleration, in case they are mid-movement.
+        # Sending Goal_Position = Present_Position halts any ongoing trajectory.
+        current_pos = self.bus.sync_read("Present_Position", num_retry=3)
+        self.bus.sync_write("Goal_Position", current_pos)
+        time.sleep(0.3)
+
         # Limit acceleration on every motor so the movement is gradual
-        for motor in self.bus.motors:
-            self.bus.write("Acceleration", motor, acceleration, normalize=False)
+        self.bus.sync_write("Acceleration", {motor: acceleration for motor in self.bus.motors}, normalize=False)
 
         # Waypoint: move to intermediate position first
         current_pos = self.bus.sync_read("Present_Position", num_retry=3)
         waypoint = {
             "shoulder_pan": current_pos["shoulder_pan"],
-            "shoulder_lift": -100.0,
-            "elbow_flex": 45.0,
+            "shoulder_lift": -85.0,
+            "elbow_flex": 50.0,
             "wrist_flex": 0.0,
-            "wrist_roll": 0.0,
+            "wrist_roll": -20,
             "gripper": 50.0,
         }
         logger.info(f"Moving {self} to waypoint position...")
@@ -309,8 +318,7 @@ class SO101Follower(Robot):
             )
 
         # Restore hardware default acceleration (254)
-        for motor in self.bus.motors:
-            self.bus.write("Acceleration", motor, 254, normalize=False)
+        self.bus.sync_write("Acceleration", {motor: 254 for motor in self.bus.motors}, normalize=False)
 
     def disconnect(self):
         if not self.is_connected:
