@@ -56,6 +56,7 @@ log = logging.getLogger(__name__)
 class PARLDiffusionConfig(DiffusionConfig):
     # Sampling
     n_samples: int = 5
+    use_q_selection: bool = True   # if False, skip multi-sample Q scoring and use a single diffusion sample
     distil_temp: float = 0.0        # 0 = argmax; >0 = softmax temperature selection
     noise_injection_std: float = 0.0  # additive noise per denoising step (flow matching)
 
@@ -535,7 +536,7 @@ class PARLDiffusionPolicy(DiffusionPolicy):
         # Rebuild batch from queues: OBS_IMAGES is already the stacked (B, s, n_cams, C, H, W)
         # tensor — individual camera keys (e.g. "observation.images.top") are no longer present.
         batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
-        if not self._q_initialized:
+        if not self._q_initialized or not self.config.use_q_selection:
             return self.diffusion.generate_actions(batch, noise=noise, full_length=full_length, action_cond=action_cond, noise_injection_std=self.config.noise_injection_std)
         # Do NOT call _stack_images here: OBS_IMAGES is already stacked from the queues above.
         return self._sample_and_select(batch, self.config.n_samples, full_length, action_cond=action_cond)
@@ -570,7 +571,7 @@ class PARLDiffusionPolicy(DiffusionPolicy):
         ).view(n_samples, B, self._horizon, self._action_dim)
 
         q_scores = self._q_score_samples(encoder_tokens, state_flat, sampled)
-        best = self._select_best(sampled, q_scores)
+        best, _ = self._select_best(sampled, q_scores)
 
         start = dm.config.n_obs_steps - 1
         return best[:, start:] if full_length else best[:, start:start + self._n_act]
@@ -593,11 +594,11 @@ class PARLDiffusionPolicy(DiffusionPolicy):
         act_n = sampled[:, :, :self._n_act].reshape(n * B, self._n_act, self._action_dim)
         return self.critic_q(enc_n, state_n, act_n).view(n, B)
 
-    def _select_best(self, sampled: Tensor, q_scores: Tensor) -> Tensor:
+    def _select_best(self, sampled: Tensor, q_scores: Tensor) -> tuple[Tensor, Tensor]:
         """
         sampled  : (n_samples, B, horizon, Da)
         q_scores : (n_samples, B)
-        returns  : (B, horizon, Da)
+        returns  : (B, horizon, Da), best_idx (B,)
         """
         n, B = sampled.shape[:2]
         if self.config.distil_temp > 0:
@@ -606,10 +607,11 @@ class PARLDiffusionPolicy(DiffusionPolicy):
         else:
             best_idx = q_scores.argmax(dim=0)                                  # (B,)
 
-        return sampled.gather(
+        best = sampled.gather(
             0,
             best_idx[None, :, None, None].expand(1, B, self._horizon, self._action_dim),
         ).squeeze(0)
+        return best, best_idx
 
     # ------------------------------------------------------------------
     # Critic loss (IQL)
@@ -718,12 +720,26 @@ class PARLDiffusionPolicy(DiffusionPolicy):
     # Actor loss (BC distillation toward Q-optimal sample)
     # ------------------------------------------------------------------
 
-    def actor_loss(self, batch: dict, ft_diffusion: nn.Module, pretrained_unet=None, num_ft_train_steps: int = 0) -> tuple[Tensor, dict]:
+    def actor_loss(
+        self,
+        batch: dict,
+        ft_diffusion: nn.Module,
+        pretrained_unet=None,
+        num_ft_train_steps: int = 0,
+        actor_alg: str = "bc",
+        dpo_beta: float = 1.0,
+        dpo_best_k: int = 1,
+        dpo_worst_k: int = 1,
+        dpo_scale: float = 1.0,
+        bc_scale: float = 0.0,
+    ) -> tuple[Tensor, dict]:
         """
         1. Sample n_samples full-horizon actions from ft_diffusion (frozen reference, no grad).
         2. Q-score on n_action_steps portion using current policy's obs encoding (no grad).
         3. Select best per state.
-        4. Diffusion BC loss toward best action (gradients through self.diffusion).
+        4. Actor loss toward best action (gradients through self.diffusion):
+             'bc'    — standard diffusion/flow BC loss (compute_loss).
+             'chain' — flow-only; reuses the sampling chain's initial noise (compute_chain_loss).
 
         Gradients flow through unet AND rgb_encoder (encoder is trained by the actor).
         ft_diffusion is the frozen reference network; only self.diffusion is updated.
@@ -736,7 +752,7 @@ class PARLDiffusionPolicy(DiffusionPolicy):
 
         assert "adv_cond" not in batch, "actor_loss does not support advantage conditioning"
 
-        # Sample from self.diffusion and Q-score (all no grad).
+        # Sample from ft_diffusion and Q-score (all no grad).
         # Reuse encoder_tokens from encode_obs for both sampling and Q-scoring to avoid
         # running the rgb_encoder twice and to keep conditioning consistent.
         with torch.no_grad():
@@ -744,17 +760,26 @@ class PARLDiffusionPolicy(DiffusionPolicy):
             encoder_tokens_n = encoder_tokens.repeat(n, *((1,) * (encoder_tokens.dim() - 1)))
             state_flat_n = state_flat.repeat(n, 1)
             global_cond_n = {"encoder_tokens": encoder_tokens_n, "state": state_flat_n}
-            sampled = ft_diffusion.conditional_sample(             # (n*B, H, Da)
+
+            sample_out = ft_diffusion.conditional_sample(   # (n*B, H, Da) [+ chain]
                 n * B, global_cond=global_cond_n,
                 pretrained_unet=pretrained_unet,
                 num_ft_train_steps=num_ft_train_steps,
                 noise_injection_std=pcfg.noise_injection_std,
-            ).view(n, B, self._horizon, self._action_dim)
+                return_chain=(actor_alg == "chain"),
+            )
+            if actor_alg == "chain":
+                sampled_flat, chains_flat = sample_out
+                # chains_flat: list of (n*B, H, Da); reshape each to (n, B, H, Da)
+                chains_n = [c.view(n, B, self._horizon, self._action_dim) for c in chains_flat]
+            else:
+                sampled_flat = sample_out
 
+            sampled = sampled_flat.view(n, B, self._horizon, self._action_dim)
             q_scores = self._q_score_samples(encoder_tokens, state_flat, sampled)  # (n, B)
-            best_action = self._select_best(sampled, q_scores)                      # (B, H, Da)
+            best_action, best_idx = self._select_best(sampled, q_scores)           # (B, H, Da)
 
-        # BC loss — grad flows through self.diffusion.compute_loss → rgb_encoder
+        # Actor loss — grad flows through self.diffusion → rgb_encoder.
         # Restrict to t < num_ft_train_steps so self.unet is only trained on the steps
         # it will actually handle at inference (pretrained_unet covers the rest).
         bc_batch = dict(obs)
@@ -762,10 +787,23 @@ class PARLDiffusionPolicy(DiffusionPolicy):
         bc_batch["action_is_pad"] = torch.zeros(
             B, self._horizon, dtype=torch.bool, device=device
         )
-        actor_loss = self.diffusion.compute_loss(
-            bc_batch,
-            max_timestep=num_ft_train_steps if num_ft_train_steps > 0 else None,
-        )
+        max_ts = num_ft_train_steps if num_ft_train_steps > 0 else None
+
+        if actor_alg == "dpo":
+            return self._actor_loss_dpo_body(
+                ft_diffusion, sampled, q_scores, encoder_tokens, state_flat,
+                B, device, num_ft_train_steps, dpo_beta, dpo_best_k, dpo_worst_k,
+                dpo_scale, bc_scale,
+            )
+
+        if actor_alg == "chain":
+            # Select the chain corresponding to the best sample for each batch element.
+            expand = (1, B, self._horizon, self._action_dim)
+            idx = best_idx[None, :, None, None].expand(*expand)
+            best_chain = [c.gather(0, idx).squeeze(0) for c in chains_n]  # list of (B, H, Da)
+            actor_loss = self.diffusion.compute_chain_loss(bc_batch, best_chain, max_timestep=max_ts)
+        else:
+            actor_loss = self.diffusion.compute_loss(bc_batch, max_timestep=max_ts)
 
         if pcfg.distil_temp > 0:
             probs = F.softmax(q_scores / pcfg.distil_temp, dim=0)  # (n, B)
@@ -781,6 +819,125 @@ class PARLDiffusionPolicy(DiffusionPolicy):
                 q_scores.max(dim=0).values - q_scores.min(dim=0).values
             ).mean().item(),
             "q_ent_global": q_ent_global,
+        }
+        return actor_loss, stats
+
+    def _actor_loss_dpo_body(
+        self,
+        ft_diffusion: nn.Module,
+        sampled: Tensor,
+        q_scores: Tensor,
+        encoder_tokens: Tensor,
+        state_flat: Tensor,
+        B: int,
+        device,
+        num_ft_train_steps: int,
+        dpo_beta: float,
+        dpo_best_k: int,
+        dpo_worst_k: int,
+        dpo_scale: float = 1.0,
+        bc_scale: float = 0.0,
+    ) -> tuple[Tensor, dict]:
+        """
+        DPO actor loss using the flow-matching denoising MSE as the log-prob surrogate.
+
+        Among the n_samples actions already sampled and Q-scored:
+          - winner a_w: random draw from top dpo_best_k  by Q
+          - loser  a_l: random draw from bottom dpo_worst_k by Q
+
+        The same noise ε and timestep t are applied to both, giving:
+          loss_w/l = ||v_θ(noisy_w/l, t, s) - (a_w/l - ε)||²  (per-sample, act_steps only)
+
+        DPO implicit reward  ≈  log π_ft(a) - log π_ref(a)  =  loss_ref - loss_ft
+        L = -E[ log σ( β · (reward_w - reward_l) ) ]
+        """
+        # ── select winner and loser from Q-ranked samples ──────────────────
+        _, top_idx = q_scores.topk(dpo_best_k,  dim=0, largest=True)   # (best_k,  B)
+        _, bot_idx = q_scores.topk(dpo_worst_k, dim=0, largest=False)  # (worst_k, B)
+
+        b_range = torch.arange(B, device=device)
+        best_idx = top_idx[torch.randint(dpo_best_k,  (B,), device=device), b_range]  # (B,)
+        worst_idx = bot_idx[torch.randint(dpo_worst_k, (B,), device=device), b_range]  # (B,)
+
+        gather = lambda idx: idx[None, :, None, None].expand(1, B, self._horizon, self._action_dim)
+        a_w = sampled.gather(0, gather(best_idx)).squeeze(0)   # (B, H, Da)
+        a_l = sampled.gather(0, gather(worst_idx)).squeeze(0)  # (B, H, Da)
+
+        # ── flow-matching noise + timestep (same for winner and loser) ─────
+        tau_min = (
+            1.0 - num_ft_train_steps / self.diffusion.num_inference_steps
+            if num_ft_train_steps > 0 else 0.0
+        )
+        t = tau_min + torch.rand(B, device=device) * (1.0 - tau_min)       # (B,)
+        noise = torch.randn(B, self._horizon, self._action_dim, device=device)
+
+        t3 = t[:, None, None]                                               # (B, 1, 1)
+        noisy_w = (1 - t3) * noise + t3 * a_w                              # (B, H, Da)
+        noisy_l = (1 - t3) * noise + t3 * a_l
+        vel_w = a_w - noise                                                  # (B, H, Da)
+        vel_l = a_l - noise
+
+        # ── train-time RTC: inpaint early steps (mirrors FlowModel.compute_loss) ─
+        timesteps_bh = t[:, None].expand(B, self._horizon).clone()          # (B, H)
+        rtc_loss_mask = None  # (B, H) True = inpainted step, excluded from loss
+        if False:
+        #if self.diffusion.config.rtc_type == "train_time":
+            d = torch.randint(0, self.diffusion.config.rtc_delay, (B,), device=device)
+            h_idx = torch.arange(self._horizon, device=device).unsqueeze(0)
+            rtc_mask = h_idx < d.unsqueeze(1)                               # (B, H)
+            timesteps_bh = timesteps_bh.masked_fill(rtc_mask, 1.0)
+            expand3 = rtc_mask.unsqueeze(-1).expand_as(noisy_w)
+            noisy_w = torch.where(expand3, a_w, noisy_w)
+            noisy_l = torch.where(expand3, a_l, noisy_l)
+            rtc_loss_mask = rtc_mask
+
+        # ── conditioning: reuse precomputed encoder_tokens / state_flat ─────
+        # rgb_encoder is frozen (freeze_image_encoder=True) and deleted from ft_diffusion;
+        # both the current unet and the reference unet use the same shared obs encoding.
+        global_cond = {"encoder_tokens": encoder_tokens, "state": state_flat}
+
+        # current policy predictions — gradients flow through self.diffusion.unet
+        pred_w_ft = self.diffusion.unet(noisy_w, timesteps_bh, global_cond=global_cond)
+        pred_l_ft = self.diffusion.unet(noisy_l, timesteps_bh, global_cond=global_cond)
+
+        with torch.no_grad():
+            pred_w_ref = ft_diffusion.unet(noisy_w, timesteps_bh, global_cond=global_cond)
+            pred_l_ref = ft_diffusion.unet(noisy_l, timesteps_bh, global_cond=global_cond)
+
+        # ── per-sample MSE over act_steps (mean over time and action dims) ─
+        act = self._n_act
+
+        def _per_sample_mse(pred: Tensor, target: Tensor) -> Tensor:
+            sq = (pred[:, :act] - target[:, :act]).pow(2)                   # (B, act, Da)
+            if rtc_loss_mask is None:
+                return sq.mean((-1, -2))                                     # (B,)
+            unmasked = ~rtc_loss_mask[:, :act].unsqueeze(-1).expand_as(sq)  # (B, act, Da)
+            count = unmasked.float().sum((-1, -2)).clamp(min=1)             # (B,)
+            return (sq * unmasked).sum((-1, -2)) / count                    # (B,)
+
+        loss_w_ft  = _per_sample_mse(pred_w_ft,  vel_w)
+        loss_l_ft  = _per_sample_mse(pred_l_ft,  vel_l)
+        loss_w_ref = _per_sample_mse(pred_w_ref, vel_w)
+        loss_l_ref = _per_sample_mse(pred_l_ref, vel_l)
+
+        # implicit log-ratio:  loss_ref - loss_ft  ≈  log π_ft - log π_ref
+        implicit_reward_w = loss_w_ref - loss_w_ft
+        implicit_reward_l = loss_l_ref - loss_l_ft
+
+        dpo_loss = -F.logsigmoid(dpo_beta * (implicit_reward_w - implicit_reward_l)).mean()
+        bc_loss = loss_w_ft.mean()
+        actor_loss = dpo_scale * dpo_loss + bc_scale * bc_loss
+
+        stats = {
+            "actor_loss":        actor_loss.item(),
+            "dpo_loss":          dpo_loss.item(),
+            "bc_loss":           bc_loss.item(),
+            "dpo_impl_reward_w": implicit_reward_w.mean().item(),
+            "dpo_impl_reward_l": implicit_reward_l.mean().item(),
+            "dpo_margin":        (implicit_reward_w - implicit_reward_l).mean().item(),
+            "q_best_mean":       q_scores.max(dim=0).values.mean().item(),
+            "q_spread_mean":     (q_scores.max(dim=0).values - q_scores.min(dim=0).values).mean().item(),
+            "q_ent_global":      0.0,
         }
         return actor_loss, stats
 

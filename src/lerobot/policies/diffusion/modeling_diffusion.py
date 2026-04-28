@@ -281,6 +281,7 @@ class DiffusionModel(nn.Module):
         pretrained_unet=None,
         num_ft_train_steps: int = 0,
         noise_injection_std: float = 0.0,
+        return_chain: bool = False,
     ) -> Tensor:
         """
         pretrained_unet: frozen pre-trained UNet used for t >= num_ft_train_steps
@@ -289,6 +290,8 @@ class DiffusionModel(nn.Module):
                             (fine-tuned); steps with t >= num_ft_train_steps use pretrained_unet.
         noise_injection_std: ignored for DDPM (noise is handled by the scheduler); used by FlowModel.
         """
+        if return_chain:
+            raise NotImplementedError("actor_alg='chain' is not supported for DDPM; use a flow matching policy.")
         assert noise_injection_std == 0.0, "Noise injection is not supported for DiffusionPolicy"
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
@@ -615,7 +618,8 @@ class FlowModel(DiffusionModel):
         pretrained_unet=None,
         num_ft_train_steps: int = 0,
         noise_injection_std: float = 0.0,
-    ) -> Tensor:
+        return_chain: bool = False,
+    ) -> "Tensor | tuple[Tensor, list[Tensor]]":
         """
         pretrained_unet: frozen pre-trained UNet used for early (high-noise) flow steps.
                          None = use self.unet throughout.
@@ -624,6 +628,10 @@ class FlowModel(DiffusionModel):
                             num_ft_train_steps, i.e. tau in [1 - num_ft_train_steps /
                             num_inference_steps, 1)) use self.unet; earlier steps use
                             pretrained_unet.
+        return_chain: if True, also return the denoising chain for FT steps as a list of
+                      tensors. chain[0] is the sample entering the first FT step (initial
+                      noise when num_ft_train_steps==0); chain[-1] equals the returned
+                      sample. Each element is (batch_size, H, Da).
         """
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
@@ -642,10 +650,19 @@ class FlowModel(DiffusionModel):
 
         # self.noise_scheduler.set_timesteps(self.num_inference_steps)
 
+        ft_step_start = (
+            0 if num_ft_train_steps == 0
+            else self.num_inference_steps - num_ft_train_steps
+        )
+        chain: list[Tensor] = []
+
         for i in range(self.num_inference_steps):
             # Flow matching: t in [0, 1). UNet expects continuous timestep (same as in compute_loss).
             tau = i / self.num_inference_steps
             taus = torch.full(sample.shape[:1], tau, dtype=dtype, device=sample.device)
+
+            if return_chain and i == ft_step_start:
+                chain.append(sample.clone())  # chain[0]: noise entering FT denoising
 
             # Use frozen pretrained UNet for early (high-noise) steps, fine-tuned UNet for later steps.
             # Fine-tuned steps are the last num_ft_train_steps steps (DDPM convention), i.e. those
@@ -718,9 +735,14 @@ class FlowModel(DiffusionModel):
             if noise_injection_std > 0.0:
                 sample = sample + noise_injection_std * torch.randn_like(sample)
 
+            if return_chain and i >= ft_step_start:
+                chain.append(sample.clone())  # chain[1..]: output of each FT step
+
         if self.config.rtc_type == 'train_time' and action_cond is not None:
             sample[:, :self.config.rtc_delay] = action_cond[:, :self.config.rtc_delay]
 
+        if return_chain:
+            return sample, chain
         return sample
 
     def compute_loss(self, batch: dict[str, Tensor], max_timestep: int | None = None) -> Tensor:
@@ -796,6 +818,59 @@ class FlowModel(DiffusionModel):
             raise NotImplementedError("Mask loss for padding is not implemented for flow model")
 
         return loss
+
+    def compute_chain_loss(
+        self,
+        batch: dict[str, Tensor],
+        chain: "list[Tensor]",
+        max_timestep: int | None = None,
+    ) -> Tensor:
+        """Flow matching loss that reuses the actual sampling chain instead of fresh noise.
+
+        Rather than drawing random noise, we use chain[0] (the sample entering the FT
+        denoising steps) as eps and chain[-1] (the final denoised action) as the target.
+        This keeps the training trajectory consistent with inference.
+
+        chain        : list of (B, H, Da) tensors collected during FT denoising.
+                       chain[0] = initial noise at ft_step_start; chain[-1] = final action.
+        max_timestep : same DDPM-convention cutoff as compute_loss; converted to tau_min.
+        """
+        assert set(batch).issuperset({OBS_STATE, "action_is_pad"})
+        assert OBS_IMAGES in batch or OBS_ENV_STATE in batch
+
+        global_cond = self._prepare_global_conditioning(batch)
+
+        eps        = chain[0]   # initial noise entering FT denoising
+        trajectory = chain[-1]  # final denoised action
+
+        B, H = trajectory.shape[:2]
+        device = get_device_from_parameters(self)
+        dtype = get_dtype_from_parameters(self)
+
+        tau_min = (
+            1.0 - max_timestep / self.num_inference_steps
+            if max_timestep is not None else 0.0
+        )
+
+        if self.config.t_schedule is None:
+            timesteps = tau_min + torch.rand(B, device=device, dtype=dtype) * (1.0 - tau_min)
+            timesteps = timesteps[:, None].expand(B, H).clone()
+        elif self.config.t_schedule == "beta0.999":
+            z = torch.distributions.Beta(1.5, 1).sample((B,)).to(device=device, dtype=dtype)
+            t = 0.999 * (1 - z)
+            t = tau_min + t * (1.0 - tau_min) / 0.999
+            timesteps = t[:, None].expand(B, H).clone()
+        else:
+            raise ValueError(f"Unsupported t_schedule: {self.config.t_schedule}")
+
+        eps        = eps.to(dtype=dtype)
+        trajectory = trajectory.to(dtype=dtype)
+
+        noisy_trajectory = (1 - timesteps.unsqueeze(-1)) * eps + timesteps.unsqueeze(-1) * trajectory
+        vel = trajectory - eps
+
+        pred = self.unet(noisy_trajectory, timesteps, global_cond=global_cond)
+        return F.mse_loss(pred, vel)
 
 
 class SpatialSoftmax(nn.Module):

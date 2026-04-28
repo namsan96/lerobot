@@ -210,7 +210,8 @@ class RobotClient:
             "debug.elapsed_ms": {"dtype": "float32", "shape": (1,), "names": ["elapsed_ms"]},
             "debug.chunk_idx": {"dtype": "float32", "shape": (1,), "names": ["chunk_idx"]},
         }
-        return combine_feature_dicts(obs_features, action_features, reward_feature, terminated_feature, debug_features)
+        world_timestamp_feature = {"world_timestamp": {"dtype": "float64", "shape": (1,), "names": ["world_timestamp"]}}
+        return combine_feature_dicts(obs_features, action_features, reward_feature, terminated_feature, debug_features, world_timestamp_feature)
 
     def _restart_keyboard_listener(self):
         self.listener, self.events = init_keyboard_listener()
@@ -509,6 +510,8 @@ class RobotClient:
         chunk_idx = 0
 
         self.robot.go_to_home()
+        if self.dataset is not None:
+            self.logger.info(f"Total frames in dataset: {self.dataset.meta.total_frames}")
         self._wait_for_enter("Press Enter to start first episode...")
 
         # Outer episode loop
@@ -609,6 +612,7 @@ class RobotClient:
                         "terminated": np.array([0.0], dtype=np.float32),
                         "debug.elapsed_ms": np.array([elapsed_ms], dtype=np.float32),
                         "debug.chunk_idx": np.array([chunk_idx], dtype=np.float32),
+                        "world_timestamp": np.array([time.time()], dtype=np.float64),
                     })
 
                 chunk_idx += 1
@@ -632,6 +636,7 @@ class RobotClient:
                 if self.events["rerecord_episode"]:
                     self.logger.info("Left arrow: discarding episode buffer, will rerecord")
                     self.dataset.clear_episode_buffer()
+                    self.logger.info(f"Total frames in dataset: {self.dataset.meta.total_frames}")
                     self._wait_for_enter("Enter to start next episode")
                 else:
                     terminated = self._prompt_terminated()
@@ -646,6 +651,7 @@ class RobotClient:
                         self.dataset._close_writer()
                         self.dataset._writer_closed_for_reading = True
                         self.logger.info(f"Episode {self.dataset.num_episodes} saved with terminated={bool(terminated)}")
+                    self.logger.info(f"Total frames in dataset: {self.dataset.meta.total_frames}")
                     self._wait_for_enter("Enter to start next episode")
             else:
                 self._wait_for_enter("Enter to restart")

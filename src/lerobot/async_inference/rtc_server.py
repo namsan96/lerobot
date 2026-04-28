@@ -500,7 +500,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                     mtime = weights_path.stat().st_mtime
                     if mtime != last_mtime:
                         last_mtime = mtime
-                        state_dict = torch.load(weights_path, map_location=self.device, weights_only=True)
+                        ckpt = torch.load(weights_path, map_location=self.device, weights_only=True)
+                        state_dict = ckpt["weights"] if isinstance(ckpt, dict) else ckpt
                         with self._policy_lock:
                             self.policy.load_state_dict(state_dict, strict=False)
                             if hasattr(self.policy, "_q_initialized"):

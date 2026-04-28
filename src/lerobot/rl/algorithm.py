@@ -57,13 +57,14 @@ class Algorithm(ABC):
         return self._policy
 
     @abstractmethod
-    def update(self, loader: DataLoader, itr: int) -> dict:
+    def update(self, loader: DataLoader, *, update_critic: bool = True, update_policy: bool = True) -> dict:
         """
-        Run one full outer iteration (however many gradient steps the algorithm needs).
+        Run one full update (however many gradient steps the algorithm needs).
 
         Args:
-            loader: DataLoader for the current dataset (may change across calls on reload).
-            itr: Outer iteration index.
+            loader: DataLoader for the current dataset.
+            update_critic: Whether to run the critic update phase.
+            update_policy: Whether to run the actor/policy update phase.
 
         Returns:
             Info dict to be logged.

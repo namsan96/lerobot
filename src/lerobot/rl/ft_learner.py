@@ -3,18 +3,15 @@ Fine-tuning learner for online RL with async inference.
 
 Design:
 - No in-memory buffer: samples directly from LeRobotDataset on disk via DataLoader
-- Periodic dataset re-instantiation to pick up new episodes from rtc_client
+- Single-shot: load dataset, run one update, save weights, exit
 - Algorithm-agnostic: policy update logic lives in Algorithm subclasses
-- Pushes updated weights to a file that rtc_server can watch and hot-swap
+- Saves updated weights to a named file; always symlinks latest.pt, optionally latest_weights.pt
 """
 
-import json
 import logging
-import time
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from threading import Event
-import sys
 
 import draccus
 import torch
@@ -40,6 +37,9 @@ class FTConfig:
     # Dataset — all --dataset.XX options (repo_id, root, image_transforms, drop_cameras, etc.)
     dataset: DatasetConfig
 
+    # Save name for this run's weights (e.g. "iter3" → output_dir/iter3.pt)
+    save_name: str = ""
+
     # delta_timestamps: auto-resolved from policy config if None (ft-specific, not in DatasetConfig)
     delta_timestamps: dict | None = None
 
@@ -50,22 +50,28 @@ class FTConfig:
     prefetch_factor: int | None = None
     grad_clip_norm: float = 1.0
 
-    # Minimum frames on disk before training starts (blocking wait)
-    min_frames_before_training: int = 1000
-
     # Drop last N frames per episode from sampling; auto-set from policy config n_action_steps if 0
     drop_n_last_frames: int = 0
 
-    # Dataset reload: wait until this many new frames arrive before each training iteration
-    env_steps_per_itr: int = 100
+    # Whether to run critic / policy update phases
+    update_critic: bool = True
+    update_policy: bool = True
 
-    # Weight push: push every N iterations, but not before weight_push_warmup_itr
-    weight_push_freq_itr: int = 10
-    weight_push_warmup_itr: int = 0
+    # If True, also update latest_weights.pt (watched by rtc_server for hot-swap).
+    # latest.pt is always updated regardless.
+    update_latest_weights: bool = False
+
+    # If True, save Q/V debug diagnostics after the update.
+    debug_info: bool = True
 
     # Checkpointing
     output_dir: str = "outputs/ft"
-    checkpoint_freq: int = 1000
+
+    # Name (without .pt) of the checkpoint to load Q/V/actor weights from before training.
+    # Special value "pretrained" skips checkpoint loading and starts from the pretrained policy as-is.
+    # E.g. "latest" loads output_dir/latest.pt, "iter2" loads output_dir/iter2.pt.
+    # Required — no default; use "pretrained" for the very first RL iteration.
+    weight_starts_from: str = ""
 
     # Algorithm config — fields map to PARLBCConfig by default (e.g. --alg.actor_lr=1e-4).
     # Override the concrete type with --alg.type=<registered_name> for other algorithms.
@@ -85,21 +91,6 @@ def make_policy(cfg: FTConfig, policy_cli_overrides: list[str] | None = None) ->
 # ---------------------------------------------------------------------------
 # Dataset helpers
 # ---------------------------------------------------------------------------
-
-def _read_dataset_info(dataset_root: Path) -> dict:
-    """Cheaply read info.json without touching parquet files."""
-    info_path = dataset_root / "meta" / "info.json"
-    with open(info_path) as f:
-        return json.load(f)
-
-
-def _read_total_frames(dataset_root: Path) -> int:
-    return _read_dataset_info(dataset_root)["total_frames"]
-
-
-def _read_total_episodes(dataset_root: Path) -> int:
-    return _read_dataset_info(dataset_root)["total_episodes"]
-
 
 def _make_dataloader(dataset: LeRobotDataset, cfg: FTConfig) -> DataLoader:
     import math
@@ -159,22 +150,47 @@ def _load_dataset(cfg: FTConfig) -> LeRobotDataset:
 
 
 # ---------------------------------------------------------------------------
-# Weight push
+# Weight saving
 # ---------------------------------------------------------------------------
 
-def push_weights(policy: nn.Module, output_dir: Path) -> None:
-    """
-    Atomically write policy state dict to disk.
+def _update_symlink(symlink: Path, target_name: str) -> None:
+    """Replace (or create) a relative symlink atomically."""
+    if symlink.is_symlink() or symlink.exists():
+        symlink.unlink()
+    symlink.symlink_to(target_name)
 
-    rtc_server can watch for `latest_weights.pt` and hot-swap on each update.
-    Atomic rename ensures the server never reads a partially written file.
+
+def save_weights(
+    policy: nn.Module,
+    output_dir: Path,
+    save_name: str,
+    update_latest_weights: bool = False,
+    total_frames: int | None = None,
+) -> None:
+    """
+    Save policy state dict to output_dir/save_name.pt.
+
+    The checkpoint is a dict {"weights": state_dict, "total_frames": N} so metadata
+    travels with the file.  Loading code extracts ["weights"] before load_state_dict.
+
+    Always updates the latest.pt symlink (used to resume training).
+    Also updates latest_weights.pt (watched by rtc_server) only when update_latest_weights=True.
+
+    Raises FileExistsError if save_name.pt already exists.
+    Symlinks are relative so the directory can be moved without breaking them.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
-    tmp = output_dir / "latest_weights.pt.tmp"
-    dst = output_dir / "latest_weights.pt"
-    torch.save(policy.state_dict(), tmp)
-    tmp.rename(dst)
-    logging.info(f"[FT_LEARNER] Weights pushed → {dst}")
+    dst = output_dir / f"{save_name}.pt"
+    if dst.exists():
+        raise FileExistsError(f"Save file already exists: {dst}. Choose a different --save_name.")
+    ckpt = {"weights": policy.state_dict(), "total_frames": total_frames}
+    torch.save(ckpt, dst)
+    _update_symlink(output_dir / "latest.pt", f"{save_name}.pt")
+    msg = f"[FT_LEARNER] Weights saved → {dst}, latest.pt updated"
+    if update_latest_weights:
+        _update_symlink(output_dir / "latest_weights.pt", f"{save_name}.pt")
+        msg += ", latest_weights.pt updated"
+    logging.info(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -184,52 +200,43 @@ def push_weights(policy: nn.Module, output_dir: Path) -> None:
 def train(
     cfg: FTConfig,
     algorithm_cls: type[Algorithm],
-    shutdown_event: Event | None = None,
 ) -> None:
     """
-    Main fine-tuning loop.
+    Single-shot fine-tuning update.
 
-    Policy is instantiated here from cfg, then passed to algorithm_cls so both
-    the training loop (weight push) and the algorithm (optimizer) share the same instance.
+    Loads the dataset once, runs one algorithm update, saves weights, and exits.
 
     Args:
         cfg: FTConfig with pretrained path, dataset path, training hyperparams, etc.
         algorithm_cls: Algorithm subclass (not instance) — instantiated here with the policy.
-        shutdown_event: Set this to cleanly stop the loop from another thread.
     """
+    if not cfg.save_name:
+        raise ValueError("--save_name must be set (e.g. --save_name=iter0).")
+
     device = get_safe_torch_device(cfg.device)
     output_dir = Path(cfg.output_dir)
-    from lerobot.utils.constants import HF_LEROBOT_HOME
-    dataset_root = Path(cfg.dataset.root) if cfg.dataset.root else HF_LEROBOT_HOME / cfg.dataset.repo_id
 
     policy = make_policy(cfg, policy_cli_overrides=cfg.policy_cli_overrides)
     policy.to(device)
     policy.train()
 
-    latest_weights = output_dir / "latest_weights.pt"
-    if latest_weights.exists():
-        policy.load_state_dict(torch.load(latest_weights, map_location=device))
-        logging.info(f"[FT_LEARNER] Resumed weights from {latest_weights}")
-
-    # if cfg.drop_n_last_frames == 0:
-    #     cfg.drop_n_last_frames = getattr(policy.config, "horizon", 0)
+    # Load Q/V/actor weights from the specified checkpoint.
+    # Use --weight_starts_from=pretrained to skip and start directly from the pretrained policy.
+    if not cfg.weight_starts_from:
+        raise ValueError(
+            "--weight_starts_from must be set (e.g. --weight_starts_from=pretrained, --weight_starts_from=latest, or --weight_starts_from=iter0)."
+        )
+    if cfg.weight_starts_from == "pretrained":
+        logging.info("[FT_LEARNER] weight_starts_from=pretrained — skipping checkpoint load, using pretrained policy weights as-is.")
+    else:
+        weight_path = output_dir / f"{cfg.weight_starts_from}.pt"
+        if not weight_path.exists():
+            raise FileNotFoundError(f"weight_starts_from checkpoint not found: {weight_path}")
+        ckpt = torch.load(weight_path, map_location=device)
+        policy.load_state_dict(ckpt["weights"] if isinstance(ckpt, dict) else ckpt)
+        logging.info(f"[FT_LEARNER] Loaded weights from {weight_path}")
 
     algorithm = algorithm_cls(policy, output_dir=output_dir)
-
-    # ---- Block until enough frames are on disk ----
-    while True:
-        if shutdown_event is not None and shutdown_event.is_set():
-            return
-        try:
-            n_frames = _read_total_frames(dataset_root)
-        except (FileNotFoundError, KeyError):
-            n_frames = 0
-        if n_frames >= cfg.min_frames_before_training:
-            break
-        logging.info(
-            f"[FT_LEARNER] Waiting for data — {n_frames}/{cfg.min_frames_before_training} frames"
-        )
-        time.sleep(5.0)
 
     dataset = _load_dataset(cfg)
 
@@ -268,57 +275,30 @@ def train(
     algorithm.preprocessor = preprocessor
     algorithm.postprocessor = postprocessor
 
-    known_frames = 0
-    initial_frames = _read_total_frames(dataset_root)
+    # ---- Early check: fail fast if the save destination already exists ----
+    dst = output_dir / f"{cfg.save_name}.pt"
+    if dst.exists():
+        raise FileExistsError(f"Save file already exists: {dst}. Choose a different --save_name.")
+
     dataloader = _make_dataloader(dataset, cfg)
 
     logging.info(
-        f"[FT_LEARNER] Starting — {initial_frames} frames on disk, "
-        f"batch_size={cfg.batch_size}, device={cfg.device}"
+        f"[FT_LEARNER] Starting — {len(dataset)} frames, "
+        f"batch_size={cfg.batch_size}, device={cfg.device}, "
+        f"update_critic={cfg.update_critic}, update_policy={cfg.update_policy}"
     )
 
-    itr = 0
+    # ---- Single update ----
+    train_stats = algorithm.update(dataloader, update_critic=cfg.update_critic, update_policy=cfg.update_policy)
 
-    while True:
-        # ---- Shutdown check ----
-        if shutdown_event is not None and shutdown_event.is_set():
-            logging.info("[FT_LEARNER] Shutdown requested, exiting.")
-            break
+    last = {**(train_stats["critic"][-1] if train_stats["critic"] else {}), **(train_stats["actor"][-1] if train_stats["actor"] else {})}
+    logging.info("[FT_LEARNER] " + " ".join(f"{k}={v:.4f}" for k, v in last.items()))
 
-        # ---- Wait until env_steps_per_itr new frames have arrived ----
-        while True:
-            if shutdown_event is not None and shutdown_event.is_set():
-                break
-            current_frames = _read_total_frames(dataset_root)
-            new_frames = current_frames - known_frames
-            if new_frames >= cfg.env_steps_per_itr:
-                break
-            logging.info(
-                f"[FT_LEARNER] Waiting for env steps — {new_frames}/{cfg.env_steps_per_itr} new frames"
-            )
-            time.sleep(1.0)
+    if cfg.debug_info:
+        algorithm.save_debug_info(dataset, save_name=cfg.save_name, train_stats=train_stats)
 
-        known_frames = current_frames
-        dataset = _load_dataset(cfg)
-        dataloader = _make_dataloader(dataset, cfg)
-        logging.info(f"[FT_LEARNER] Dataset reloaded — {len(dataset)} frames total ({new_frames} new)")
-
-        # ---- One outer iteration (algorithm decides how many gradient steps) ----
-        itr_info = algorithm.update(dataloader, itr)
-        itr += 1
-
-        logging.info(f"[FT_LEARNER] itr={itr} " + " ".join(f"{k}={v:.4f}" for k, v in itr_info.items()))
-
-        # ---- Periodic weight push to rtc_server ----
-        if itr >= cfg.weight_push_warmup_itr and itr % cfg.weight_push_freq_itr == 0:
-            push_weights(algorithm.policy, output_dir)
-
-        # ---- Checkpoint ----
-        if itr % cfg.checkpoint_freq == 0:
-            ckpt_path = output_dir / "checkpoints" / f"itr_{itr:08d}.pt"
-            ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save({"itr": itr, "policy": algorithm.policy.state_dict()}, ckpt_path)
-            logging.info(f"[FT_LEARNER] Checkpoint saved → {ckpt_path}")
+    # ---- Save weights ----
+    save_weights(algorithm.policy, output_dir, cfg.save_name, update_latest_weights=cfg.update_latest_weights, total_frames=len(dataset))
 
 
 # ---------------------------------------------------------------------------
@@ -345,16 +325,15 @@ def serve(cfg: FTConfig):
             --batch_size=64 \\
             --num_workers=4 \\
             --prefetch_factor=4 \\
-            --min_frames_before_training=500 \\
-            --env_steps_per_itr=100 \\
-            --weight_push_freq_itr=5 \\
+            --save_name=iter0 \\
             --output_dir=outputs/rl/pick_and_place \\
+            --update_critic=true \\
+            --update_policy=true \\
             --alg.type=parl_bc \\
             --alg.num_ft_train_steps=100 \\
             --alg.actor_lr=1e-4 \\
             --alg.critic_lr=1e-4 \\
             --alg.n_batch_per_itr=10 \\
-            --alg.n_critic_warmup_itr=5 \\
             --alg.freeze_image_encoder=True \\
             --policy.dinov3_hub_repo=facebookresearch/dinov2 \\
             --policy.dinov3_hub_weights=dinov2_vits14

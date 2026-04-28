@@ -9,7 +9,6 @@ PARLDiffusionPolicy, so this file only owns the optimizers and update schedule.
 """
 
 import copy
-import json
 import logging
 import random
 from dataclasses import dataclass
@@ -47,16 +46,10 @@ class PARLBCConfig(AlgorithmConfig):
     # Gradient steps per outer iteration
     n_batch_per_itr: int = 10
 
-    # Number of outer iterations to train critic only before actor updates begin
-    n_critic_warmup_itr: int = 0
-
     # Number of fine-tuned denoising steps: t < num_ft_train_steps uses ft_diffusion,
     # t >= num_ft_train_steps uses the frozen pretrained UNet.
     # Must equal num_train_timesteps (all steps ft) OR freeze_image_encoder must be True.
     num_ft_train_steps: int = None  # required — no default
-
-    # Run actor update only every N outer iterations (1 = every iteration)
-    policy_update_period: int = 1
 
     # Target Q EMA update every N critic steps
     target_update_freq: int = 1
@@ -64,13 +57,21 @@ class PARLBCConfig(AlgorithmConfig):
     # Freeze image encoder during actor updates
     freeze_image_encoder: bool = False
 
+    # Actor algorithm: 'bc' = standard diffusion loss on best action;
+    # 'chain' = reuse the sampling chain's initial noise for the flow loss (flow only).
+    # 'dpo'   = DPO implicit reward loss (winner vs loser from Q ranking).
+    actor_alg: str = "bc"
+
+    # DPO hyperparameters (used when actor_alg='dpo')
+    dpo_beta: float = 1.0    # KL regularisation strength
+    dpo_best_k: int = 1      # winner is drawn from top-k samples
+    dpo_worst_k: int = 1     # loser  is drawn from bottom-k samples
+    dpo_scale: float = 1.0   # weight on DPO loss term
+    bc_scale: float = 0.0    # weight on BC loss term (loss_w_ft)
+
     # Mixed-precision training: "fp16", "bf16", or None (disabled).
     # fp16 uses a GradScaler; bf16 does not.
     mixed_precision: str | None = None
-
-    # Debug info: save Q/V trajectories and sampled action chunks every N outer iterations.
-    # 0 = disabled.
-    debug_info_freq: int = 1
 
     def make_algorithm(self, policy: "PARLDiffusionPolicy", output_dir=None) -> "PARLBCAlgorithm":
         return PARLBCAlgorithm(policy, cfg=self, output_dir=output_dir)
@@ -167,7 +168,7 @@ class PARLBCAlgorithm(Algorithm):
         self._current_loader: DataLoader | None = None
         self._data_iter = None
 
-        self._debug_info_dir = Path(output_dir) / "debug_info" if output_dir is not None else Path("debug_info")
+        self._output_dir = Path(output_dir) if output_dir is not None else Path(".")
 
     @property
     def policy(self) -> PARLDiffusionPolicy:
@@ -233,46 +234,36 @@ class PARLBCAlgorithm(Algorithm):
     # Main entry point
     # ------------------------------------------------------------------
 
-    def update(self, loader: DataLoader, itr: int) -> dict:
+    def update(self, loader: DataLoader, *, update_critic: bool = True, update_policy: bool = True) -> dict:
         # 1. Reset actor to ft_diffusion before this iteration's distillation
         self._sync_distilling_from_ft()
 
-        # 2. Critic phase — accumulate stats across steps
+        # 2. Critic phase
         critic_stats_list = []
-        for step in range(self.cfg.n_batch_per_itr):
-            batch = self._next_batch(loader)
-            info = self._critic_update(batch)
-            critic_stats_list.append(info)
-            print(f"  critic itr={itr} step={step}  " + "  ".join(f"{k}={v:.6f}" for k, v in info.items()))
-            if step % self.cfg.target_update_freq == 0:
-                self.policy.update_target_q()
-        self.critic_optimizer.zero_grad(set_to_none=True)
+        if update_critic:
+            for step in range(self.cfg.n_batch_per_itr):
+                batch = self._next_batch(loader)
+                info = self._critic_update(batch)
+                critic_stats_list.append(info)
+                print(f"  critic step={step}  " + "  ".join(f"{k}={v:.6f}" for k, v in info.items()))
+                if step % self.cfg.target_update_freq == 0:
+                    self.policy.update_target_q()
+            self.critic_optimizer.zero_grad(set_to_none=True)
 
-        # 3. Actor phase (after critic warmup, every policy_update_period iterations)
+        # 3. Actor phase
         actor_stats_list = []
-        if itr >= self.cfg.n_critic_warmup_itr and itr % self.cfg.policy_update_period == 0:
+        if update_policy:
             for step in range(self.cfg.n_batch_per_itr):
                 batch = self._next_batch(loader)
                 info = self._actor_update(batch)
                 actor_stats_list.append(info)
-                print(f"  actor  itr={itr} step={step}  " + "  ".join(f"{k}={v:.6f}" for k, v in info.items()))
-        self.actor_optimizer.zero_grad(set_to_none=True)
+                print(f"  actor  step={step}  " + "  ".join(f"{k}={v:.6f}" for k, v in info.items()))
+            self.actor_optimizer.zero_grad(set_to_none=True)
 
         # 4. Push updated actor back to ft_diffusion
         self._sync_ft_from_distilling()
 
-        # Save full per-step history to debug_info_dir/stats.jsonl (one line per iter)
-        self._debug_info_dir.mkdir(parents=True, exist_ok=True)
-        with open(self._debug_info_dir / "stats.jsonl", "a") as f:
-            f.write(json.dumps({"itr": itr, "critic": critic_stats_list, "actor": actor_stats_list}) + "\n")
-
-        # 5. Periodic debug info dump
-        if self.cfg.debug_info_freq > 0 and itr % self.cfg.debug_info_freq == 0:
-            self.debug_info(loader.dataset, itr)
-
-        last_critic = critic_stats_list[-1] if critic_stats_list else {}
-        last_actor  = actor_stats_list[-1]  if actor_stats_list  else {}
-        return {**last_critic, **last_actor}
+        return {"critic": critic_stats_list, "actor": actor_stats_list}
 
     # ------------------------------------------------------------------
     # Critic update
@@ -306,6 +297,12 @@ class PARLBCAlgorithm(Algorithm):
                 batch, self.ft_diffusion,
                 pretrained_unet=self.policy.pretrained_unet,
                 num_ft_train_steps=self.cfg.num_ft_train_steps,
+                actor_alg=self.cfg.actor_alg,
+                dpo_beta=self.cfg.dpo_beta,
+                dpo_best_k=self.cfg.dpo_best_k,
+                dpo_worst_k=self.cfg.dpo_worst_k,
+                dpo_scale=self.cfg.dpo_scale,
+                bc_scale=self.cfg.bc_scale,
             )
 
         self._scaler.scale(actor_loss).backward()
@@ -322,7 +319,7 @@ class PARLBCAlgorithm(Algorithm):
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def debug_info(self, dataset, itr: int) -> None:
+    def save_debug_info(self, dataset, save_name: str, train_stats: dict | None = None) -> None:
         """Compute and save debug diagnostics for the current policy.
 
         Samples up to 5 random episodes, then for each episode:
@@ -334,7 +331,7 @@ class PARLBCAlgorithm(Algorithm):
             full episode.
 
         Everything is saved as a single .pt file:
-            {debug_info_dir}/debug_info_{itr:06d}.pt
+            {debug_info_dir}/{save_name}.pt
         """
         policy = self.policy
         was_training = policy.training
@@ -435,9 +432,9 @@ class PARLBCAlgorithm(Algorithm):
                 "sampled_actions": sampled_at_keyframes,
             })
 
-        out_path = self._debug_info_dir / f"debug_info_{itr:06d}.pt"
+        out_path = self._output_dir / f"{save_name}_debug_info.pt"
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({"itr": itr, "episodes": episodes_out}, out_path)
+        torch.save({"episodes": episodes_out, "train_stats": train_stats}, out_path)
         log.info(f"[PARL] Debug info saved → {out_path}")
 
         if was_training:
